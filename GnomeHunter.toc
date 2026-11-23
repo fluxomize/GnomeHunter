@@ -1,0 +1,13 @@
+## Interface: 16001
+
+## Title: GnomeHunter
+## Notes: Ranking de guild - quem mais matou gnomos
+
+## Version: 2.4.17
+## Author: Fluxomize
+## SavedVariables: GnomeHunterDB
+## LoadSavedVariablesFirst: true
+
+## IconTexture: Interface\ICONS\INV_Misc_Head_Gnome_01
+
+GnomeHunter.lua
