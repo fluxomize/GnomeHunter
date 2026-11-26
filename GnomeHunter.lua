@@ -1,4 +1,4 @@
--- GnomeHunter v2.4.17 - anúncio de morte desligado por padrão + só open-world PvP
+-- GnomeHunter v2.5.0 - ranking semanal (zera terça 12:00 BRT) + ranking geral
 -- Estratégia de kill baseada no Spy (WoW Forever / Interface 16001)
 
 local BOOT = CreateFrame("Frame")
@@ -11,10 +11,18 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     -- Constantes
     -- =================================================================
     local ADDON_PREFIX   = "GNMHUNT"
-    local VERSION        = "2.4.17"
+    local VERSION        = "2.5.0"
     local BOUNTY_BONUS   = 10    -- pontos extras pelo bounty de player
     local GUILD_BONUS    = 1     -- pontos extras por matar qualquer um da guild bounty
     local ALERT_COOLDOWN = 60    -- segundos entre alertas do mesmo nome
+    local MAX_PUBLISH    = 20    -- máximo de linhas de ranking no /gnomo publish
+
+    -- Ranking semanal: vira toda terça às 12:00 de Brasília (UTC-3, sem horário de
+    -- verão) = terça 15:00 UTC. Âncora: terça 2024-01-02 15:00:00 UTC.
+    -- Usamos o relógio do SERVIDOR (GetServerTime) pra todos os clientes
+    -- da guild concordarem sobre qual é a semana atual.
+    local WEEK_SECONDS   = 7 * 24 * 60 * 60
+    local WEEK_ANCHOR    = 1704207600
 
     -- =================================================================
     -- DB
@@ -33,6 +41,14 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     if GnomeHunterDB.opts.bountyAlerts  == nil then GnomeHunterDB.opts.bountyAlerts  = true  end
     if GnomeHunterDB.opts.announce      == nil then GnomeHunterDB.opts.announce      = true  end
     if GnomeHunterDB.opts.announceDeath == nil then GnomeHunterDB.opts.announceDeath = false end
+    if GnomeHunterDB.opts.rankView ~= "all" then GnomeHunterDB.opts.rankView = "week" end
+
+    -- Ranking semanal: mesma estrutura do geral (kills = pts, kcount = kills brutos),
+    -- mais o weekId da semana a que esses números pertencem.
+    GnomeHunterDB.weekly        = GnomeHunterDB.weekly        or {}
+    GnomeHunterDB.weekly.weekId = GnomeHunterDB.weekly.weekId or -1
+    GnomeHunterDB.weekly.kills  = GnomeHunterDB.weekly.kills  or {}
+    GnomeHunterDB.weekly.kcount = GnomeHunterDB.weekly.kcount or {}
     -- Migração: força off pra quem já estava com announceDeath ligado por padrão em v2.4.15
     if not GnomeHunterDB.migratedDeathOff then
         GnomeHunterDB.opts.announceDeath = false
@@ -120,7 +136,8 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     -- referências de UI
     local rankFrame
     local bountyPlayerText, bountyGuildText
-    local scoreText, rankText
+    local scoreText, rankText, scoreLabel
+    local tabWeek, tabAll, footerHint
     local rankLines = {}
     local guildCheck, alertCheck, announceCheck
     local btnSetBounty, btnSetGuildBounty, btnReset
@@ -143,10 +160,66 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         DEFAULT_CHAT_FRAME:AddMessage("|cFFFF8000[GnomeHunter]|r " .. tostring(msg))
     end
 
+    -- =================================================================
+    -- Semana (ranking semanal)
+    -- =================================================================
+    local function ServerNow()
+        if GetServerTime then
+            local ok, t = pcall(GetServerTime)
+            if ok and type(t) == "number" and t > 0 then return t end
+        end
+        return time()
+    end
+
+    local function CurrentWeekId()
+        return math.floor((ServerNow() - WEEK_ANCHOR) / WEEK_SECONDS)
+    end
+
+    -- Segundos até a próxima virada (terça 12:00 BRT)
+    local function SecondsToWeeklyReset()
+        local nextReset = WEEK_ANCHOR + (CurrentWeekId() + 1) * WEEK_SECONDS
+        return math.max(0, nextReset - ServerNow())
+    end
+
+    local function FormatDuration(sec)
+        sec = math.floor(sec)
+        local d = math.floor(sec / 86400)
+        local h = math.floor((sec % 86400) / 3600)
+        local m = math.floor((sec % 3600) / 60)
+        if d > 0 then return ("%dd %dh"):format(d, h) end
+        if h > 0 then return ("%dh %dmin"):format(h, m) end
+        return ("%dmin"):format(m)
+    end
+
+    -- Zera o ranking semanal se a semana virou. Retorna true se zerou.
+    local function EnsureWeek()
+        local w = GnomeHunterDB.weekly
+        local cur = CurrentWeekId()
+        if w.weekId == cur then return false end
+        w.weekId = cur
+        wipe(w.kills)
+        wipe(w.kcount)
+        return true
+    end
+
+    -- Os dois "stores" de score têm a mesma forma: { kills = {}, kcount = {} }
+    local function ScoreStore(view)
+        if view == "week" then return GnomeHunterDB.weekly end
+        return GnomeHunterDB
+    end
+    local SCORE_STORES = { "all", "week" }
+
+    local function ViewLabel(view)
+        return view == "week" and "Semanal" or "Geral"
+    end
+
     local function EnsureEntry(name)
         if not name then return end
-        if not GnomeHunterDB.kills[name]  then GnomeHunterDB.kills[name]  = 0 end
-        if not GnomeHunterDB.kcount[name] then GnomeHunterDB.kcount[name] = 0 end
+        for _, view in ipairs(SCORE_STORES) do
+            local s = ScoreStore(view)
+            if not s.kills[name]  then s.kills[name]  = 0 end
+            if not s.kcount[name] then s.kcount[name] = 0 end
+        end
     end
 
     -- Broadcast para a guild inteira
@@ -183,7 +256,19 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             playerName,
             GnomeHunterDB.kills[playerName]  or 0,
             GnomeHunterDB.kcount[playerName] or 0)
-        if target then Whisper(payload, target) else Broadcast(payload) end
+        -- Score semanal vai numa mensagem separada: clientes antigos ignoram
+        -- comandos desconhecidos, então isso não quebra quem ainda está na v2.4.
+        EnsureWeek()
+        local w = GnomeHunterDB.weekly
+        local wpayload = ("WSCORE:%s:%d:%d:%d"):format(
+            playerName, w.weekId,
+            w.kills[playerName]  or 0,
+            w.kcount[playerName] or 0)
+        if target then
+            Whisper(payload, target); Whisper(wpayload, target)
+        else
+            Broadcast(payload); Broadcast(wpayload)
+        end
     end
     local function BroadcastMyScore() SendMyScore(nil) end
 
@@ -296,22 +381,21 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     -- Varre o DB de kills procurando entries que têm versão mais completa no roster
     -- e consolida usando MAX (ambas são o MESMO player, não soma).
     local function MigrateKillsToFullNames()
-        local moves = {}
-        for name in pairs(GnomeHunterDB.kills) do
-            local fullName = FindFullNameInRoster(name)
-            if fullName and fullName ~= name then
-                moves[name] = fullName
+        for _, view in ipairs(SCORE_STORES) do
+            local s = ScoreStore(view)
+            local moves = {}
+            for name in pairs(s.kills) do
+                local fullName = FindFullNameInRoster(name)
+                if fullName and fullName ~= name then
+                    moves[name] = fullName
+                end
             end
-        end
-        for shortName, fullName in pairs(moves) do
-            GnomeHunterDB.kills[fullName]  = math.max(
-                GnomeHunterDB.kills[fullName]  or 0,
-                GnomeHunterDB.kills[shortName] or 0)
-            GnomeHunterDB.kcount[fullName] = math.max(
-                GnomeHunterDB.kcount[fullName]  or 0,
-                GnomeHunterDB.kcount[shortName] or 0)
-            GnomeHunterDB.kills[shortName]  = nil
-            GnomeHunterDB.kcount[shortName] = nil
+            for shortName, fullName in pairs(moves) do
+                s.kills[fullName]  = math.max(s.kills[fullName]  or 0, s.kills[shortName]  or 0)
+                s.kcount[fullName] = math.max(s.kcount[fullName] or 0, s.kcount[shortName] or 0)
+                s.kills[shortName]  = nil
+                s.kcount[shortName] = nil
+            end
         end
     end
 
@@ -403,8 +487,14 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         if isGuildBounty then pts = pts + GUILD_BONUS end
         if pts == 0 then return end
 
-        GnomeHunterDB.kills[playerName]  = (GnomeHunterDB.kills[playerName]  or 0) + pts
-        GnomeHunterDB.kcount[playerName] = (GnomeHunterDB.kcount[playerName] or 0) + 1
+        EnsureWeek()
+        EnsureEntry(playerName)
+        for _, view in ipairs(SCORE_STORES) do
+            local s = ScoreStore(view)
+            s.kills[playerName]  = (s.kills[playerName]  or 0) + pts
+            s.kcount[playerName] = (s.kcount[playerName] or 0) + 1
+        end
+        local w = GnomeHunterDB.weekly
 
         -- mensagem por prioridade
         local tag
@@ -418,7 +508,8 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             tag = "|cFFFF2020Gnomo abatido:|r "
         end
         Print(tag .. (victimName or "?") .. ("|cFF00FF00 (+%d pt)|r"):format(pts)
-              .. (" - %d kills / %d pts"):format(
+              .. (" - semana: %d kills / %d pts | geral: %d kills / %d pts"):format(
+                  w.kcount[playerName], w.kills[playerName],
                   GnomeHunterDB.kcount[playerName], GnomeHunterDB.kills[playerName]))
         BroadcastMyScore()
 
@@ -445,13 +536,16 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     -- =================================================================
     -- Ranking
     -- =================================================================
-    local function BuildRankingList()
+    -- view: "week" (semanal) ou "all" (geral)
+    local function BuildRankingList(view)
+        local store = ScoreStore(view)
+        if view == "week" then EnsureWeek() end
         local filter = GnomeHunterDB.opts.guildOnly
         -- Etapa 1: resolve cada entry do DB para o nome mais completo (via roster)
         --          e coalesce duplicatas usando MAX (não soma) - ambas representam o
         --          mesmo player, então pegar o maior valor é o correto.
         local resolved = {}  -- fullName -> { pts, kcount }
-        for name, pts in pairs(GnomeHunterDB.kills) do
+        for name, pts in pairs(store.kills) do
             local resolvedName = FindFullNameInRoster(name) or name
             local r = resolved[resolvedName]
             if not r then
@@ -459,13 +553,15 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
                 resolved[resolvedName] = r
             end
             r.pts    = math.max(r.pts,    pts)
-            r.kcount = math.max(r.kcount, GnomeHunterDB.kcount[name] or pts)
+            r.kcount = math.max(r.kcount, store.kcount[name] or pts)
         end
-        -- Etapa 2: filtra por guild e monta a lista final
+        -- Etapa 2: filtra por guild e monta a lista final.
+        -- No semanal, quem tem 0 nesta semana não aparece (exceto você).
         local list = {}
         for name, r in pairs(resolved) do
             local key = NormKey(name)
-            if (not filter) or (key and guildSet[key]) or key == playerKey then
+            local hasScore = view ~= "week" or r.pts > 0 or key == playerKey
+            if hasScore and ((not filter) or (key and guildSet[key]) or key == playerKey) then
                 table.insert(list, { name = name, count = r.pts, kills = r.kcount })
             end
         end
@@ -477,20 +573,25 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         return list
     end
 
-    local function MyRankAndScore()
-        local list = BuildRankingList()
+    local function MyRankAndScore(view)
+        local list = BuildRankingList(view)
+        local store = ScoreStore(view)
         local myPos = 0
         for i, e in ipairs(list) do
             if e.name == playerName then myPos = i; break end
         end
         return myPos,
-               GnomeHunterDB.kills[playerName]  or 0,
-               GnomeHunterDB.kcount[playerName] or 0
+               store.kills[playerName]  or 0,
+               store.kcount[playerName] or 0
     end
 
-    local function ShowRankingChat()
-        Print("=== RANKING DE GNOMICÍDIO ===")
-        local list = BuildRankingList()
+    local function ShowRankingChat(view)
+        view = view or "week"
+        Print(("=== RANKING DE GNOMICÍDIO - %s ==="):format(string.upper(ViewLabel(view))))
+        if view == "week" then
+            Print("Zera em " .. FormatDuration(SecondsToWeeklyReset()) .. " (terça 12:00)")
+        end
+        local list = BuildRankingList(view)
         if #list == 0 then
             Print("Nenhum gnomo abatido ainda. Vai lá!")
             return
@@ -503,13 +604,16 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
 
     -- Envia o ranking no chat da guild (uma linha por entrada, até top 10)
     -- Delay de 0.3s entre mensagens para o server não reordenar
-    local function PublishRankingToGuild(top)
+    local function PublishRankingToGuild(top, view)
+        view = view or "week"
         if not IsInGuild() then
             Print("Você não está em uma guild.")
             return
         end
-        top = top or 10
-        local list = BuildRankingList()
+        top = math.floor(tonumber(top) or 10)
+        if top < 1 then top = 1 end
+        if top > MAX_PUBLISH then top = MAX_PUBLISH end
+        local list = BuildRankingList(view)
         if #list == 0 then
             Print("Nada para publicar ainda.")
             return
@@ -518,7 +622,12 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         local pb = GnomeHunterDB.bounty
         local gb = GnomeHunterDB.guildBounty
         local lines = {}
-        table.insert(lines, "=== GnomeHunter - Ranking ===")
+        if view == "week" then
+            table.insert(lines, ("=== GnomeHunter - Ranking Semanal (zera em %s) ==="):format(
+                FormatDuration(SecondsToWeeklyReset())))
+        else
+            table.insert(lines, "=== GnomeHunter - Ranking Geral ===")
+        end
         if pb and pb.name then
             table.insert(lines, ("Bounty: %s (%s) - vale +%d pts"):format(
                 pb.name, pb.race or "?", BOUNTY_BONUS))
@@ -543,7 +652,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         else
             for _, line in ipairs(lines) do SafeChat(line, "GUILD") end
         end
-        Print(("Ranking publicado no chat da guild (top %d)."):format(n))
+        Print(("Ranking %s publicado no chat da guild (top %d)."):format(ViewLabel(view), n))
     end
 
     -- =================================================================
@@ -580,8 +689,31 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         if alertCheck then alertCheck:SetChecked(GnomeHunterDB.opts.bountyAlerts) end
         if announceCheck then announceCheck:SetChecked(GnomeHunterDB.opts.announce) end
 
+        local view = GnomeHunterDB.opts.rankView
+        EnsureWeek()
+
+        -- abas Semanal / Geral: a ativa fica com highlight travado
+        if tabWeek and tabAll then
+            if view == "week" then
+                tabWeek:LockHighlight(); tabAll:UnlockHighlight()
+            else
+                tabAll:LockHighlight(); tabWeek:UnlockHighlight()
+            end
+        end
+        if footerHint then
+            if view == "week" then
+                footerHint:SetText(("Semanal zera em |cFFFFD100%s|r (terça 12:00)"):format(
+                    FormatDuration(SecondsToWeeklyReset())))
+            else
+                footerHint:SetText("/gnomo help  -  comandos")
+            end
+        end
+
         -- score / rank do player
-        local myPos, myScore, myKills = MyRankAndScore()
+        local myPos, myScore, myKills = MyRankAndScore(view)
+        if scoreLabel then
+            scoreLabel:SetText(view == "week" and "Semana:" or "Geral:")
+        end
         if scoreText then
             scoreText:SetText(("|cFFFFD100%d|r kills |cFFAAAAAA(%d pts)|r"):format(myKills, myScore))
         end
@@ -606,7 +738,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         end
 
         -- lista
-        local list = BuildRankingList()
+        local list = BuildRankingList(view)
         for i = 1, #rankLines do
             local line = rankLines[i]
             local entry = list[i]
@@ -705,9 +837,9 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         scoreCard:SetPoint("TOPRIGHT", -10, -56)
         scoreCard:SetHeight(44)
 
-        local scoreLabel = rankFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+        scoreLabel = rankFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
         scoreLabel:SetPoint("LEFT", scoreCard, "LEFT", 12, 0)
-        scoreLabel:SetText("Teu score:")
+        scoreLabel:SetText("Semana:")
 
         scoreText = rankFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
         scoreText:SetPoint("LEFT", scoreLabel, "RIGHT", 6, 0)
@@ -830,9 +962,18 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         rankHeader:SetPoint("TOPRIGHT", -10, -294)
         rankHeader:SetHeight(20)
 
-        local rh = rankFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        rh:SetPoint("LEFT", rankHeader, "LEFT", 10, 0)
-        rh:SetText("|cFFFFD100TOP KILLERS|r")
+        -- abas Semanal / Geral no lugar do título "TOP KILLERS"
+        local function SetView(v)
+            GnomeHunterDB.opts.rankView = v
+            RefreshRankFrame()
+        end
+        tabWeek = MakeButton(rankFrame, "Semanal", 76, 18)
+        tabWeek:SetPoint("LEFT", rankHeader, "LEFT", 4, 0)
+        tabWeek:SetScript("OnClick", function() SetView("week") end)
+
+        tabAll = MakeButton(rankFrame, "Geral", 76, 18)
+        tabAll:SetPoint("LEFT", tabWeek, "RIGHT", 4, 0)
+        tabAll:SetScript("OnClick", function() SetView("all") end)
 
         local rhRight = rankFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         rhRight:SetPoint("RIGHT", rankHeader, "RIGHT", -10, 0)
@@ -882,12 +1023,12 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         local btnPublish = MakeButton(rankFrame, "Publicar", 78, 22)
         btnPublish:SetPoint("LEFT", btnSync, "RIGHT", 4, 0)
         btnPublish:SetScript("OnClick", function()
-            StaticPopup_Show("GNOMEHUNTER_PUBLISH")
+            StaticPopup_Show("GNOMEHUNTER_PUBLISH", string.lower(ViewLabel(GnomeHunterDB.opts.rankView)))
         end)
         btnPublish:SetScript("OnEnter", function(self)
             GameTooltip:SetOwner(self, "ANCHOR_TOP")
             GameTooltip:AddLine("Enviar ranking no chat da guild")
-            GameTooltip:AddLine("Top 10 + bounties ativos", 0.8, 0.8, 0.8)
+            GameTooltip:AddLine("Top 10 da aba selecionada + bounties ativos", 0.8, 0.8, 0.8)
             GameTooltip:Show()
         end)
         btnPublish:SetScript("OnLeave", function() GameTooltip:Hide() end)
@@ -917,9 +1058,9 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         end)
 
         -- Hint no rodapé
-        local hint = rankFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-        hint:SetPoint("BOTTOM", 0, 40)
-        hint:SetText("/gnomo help  -  comandos")
+        footerHint = rankFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        footerHint:SetPoint("BOTTOM", 0, 40)
+        footerHint:SetText("/gnomo help  -  comandos")
 
         rankFrame:Hide()
     end
@@ -991,9 +1132,13 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         btn:SetScript("OnEnter", function(self)
             GameTooltip:SetOwner(self, "ANCHOR_LEFT")
             GameTooltip:AddLine("|cFFFF8000GnomeHunter|r v"..VERSION)
-            local pts = GnomeHunterDB.kills[playerName]  or 0
-            local kc  = GnomeHunterDB.kcount[playerName] or 0
-            GameTooltip:AddLine(("Seus kills: |cFFFFD100%d|r (|cFFAAAAAA%d pts|r)"):format(kc, pts), 1, 1, 1)
+            EnsureWeek()
+            local w = GnomeHunterDB.weekly
+            GameTooltip:AddLine(("Semana: |cFFFFD100%d|r kills (|cFFAAAAAA%d pts|r)"):format(
+                w.kcount[playerName] or 0, w.kills[playerName] or 0), 1, 1, 1)
+            GameTooltip:AddLine(("Geral: |cFFFFD100%d|r kills (|cFFAAAAAA%d pts|r)"):format(
+                GnomeHunterDB.kcount[playerName] or 0, GnomeHunterDB.kills[playerName] or 0), 1, 1, 1)
+            GameTooltip:AddLine("Semanal zera em " .. FormatDuration(SecondsToWeeklyReset()), 0.6, 0.6, 0.6)
             local pb = GnomeHunterDB.bounty
             if pb and pb.name then
                 GameTooltip:AddLine(("Bounty: %s (+%d pts)"):format(pb.name, BOUNTY_BONUS), 1, 0.82, 0)
@@ -1017,7 +1162,9 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         btn:SetScript("OnDragStart", function(self)
             self:SetScript("OnUpdate", function()
                 local mx, my = GetCursorPosition()
-                local scale = UIParent:GetEffectiveScale() or 1
+                -- GetCenter() do Minimap vem no espaço de coordenadas DELE,
+                -- então o cursor precisa ser convertido pela escala efetiva do Minimap
+                local scale = Minimap:GetEffectiveScale() or 1
                 mx, my = mx / scale, my / scale
                 local cx, cy = Minimap:GetCenter()
                 if cx and cy then
@@ -1179,12 +1326,14 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     }
 
     StaticPopupDialogs["GNOMEHUNTER_RESETME"] = {
-        text = "Zerar seu próprio score?",
+        text = "Zerar seu próprio score (semanal e geral)?",
         button1 = "Sim", button2 = CANCEL,
         OnAccept = function()
             if playerName then
-                GnomeHunterDB.kills[playerName]  = 0
-                GnomeHunterDB.kcount[playerName] = 0
+                for _, view in ipairs(SCORE_STORES) do
+                    ScoreStore(view).kills[playerName]  = 0
+                    ScoreStore(view).kcount[playerName] = 0
+                end
                 BroadcastMyScore()
                 Print("Sua contagem foi zerada.")
                 RefreshRankFrame()
@@ -1199,9 +1348,11 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         OnAccept = function()
             if not IsGuildOfficer() then return end
             local at = time()
-            -- zera localmente
+            -- zera localmente (geral + semanal)
             GnomeHunterDB.kills  = {}
             GnomeHunterDB.kcount = {}
+            wipe(GnomeHunterDB.weekly.kills)
+            wipe(GnomeHunterDB.weekly.kcount)
             if playerName then EnsureEntry(playerName) end
             GnomeHunterDB.resetAt = at
             Print("|cFFFFD100Ranking zerado para toda a guild.|r")
@@ -1213,9 +1364,9 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     }
 
     StaticPopupDialogs["GNOMEHUNTER_PUBLISH"] = {
-        text = "Publicar ranking no chat da guild? (top 10 + bounties ativos)",
+        text = "Publicar ranking %s no chat da guild? (top 10 + bounties ativos)",
         button1 = "Publicar", button2 = CANCEL,
-        OnAccept = function() PublishRankingToGuild(10) end,
+        OnAccept = function() PublishRankingToGuild(10, GnomeHunterDB.opts.rankView) end,
         timeout = 0, whileDead = 1, hideOnEscape = 1, preferredIndex = 3,
     }
 
@@ -1227,8 +1378,10 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         local lower = string.lower(msg)
         local cmd, rest = string.match(lower, "^(%S+)%s*(.*)$")
 
-        if lower == "" then
-            ShowRankingChat()
+        if lower == "" or cmd == "semana" or cmd == "semanal" or cmd == "week" then
+            ShowRankingChat("week")
+        elseif cmd == "geral" or cmd == "all" or cmd == "total" then
+            ShowRankingChat("all")
         elseif cmd == "ui" or cmd == "show" or cmd == "janela" then
             ToggleGUI()
         elseif cmd == "sync" then
@@ -1305,12 +1458,31 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
                 BroadcastGuildBounty()
             end
         elseif cmd == "publish" or cmd == "publicar" or cmd == "share" then
-            local n = tonumber(rest) or 10
-            PublishRankingToGuild(n)
+            -- /gnomo publish [N] [semana|geral]  (ordem livre; padrão: 10, semanal)
+            local n, view = 10, "week"
+            for word in string.gmatch(rest or "", "%S+") do
+                if word == "geral" or word == "all" or word == "total" then
+                    view = "all"
+                elseif word == "semana" or word == "semanal" or word == "week" then
+                    view = "week"
+                else
+                    n = tonumber(word)
+                    if not n or n < 1 or n ~= math.floor(n) then
+                        Print(("Uso: /gnomo publish [N] [semana|geral]  (N entre 1 e %d)"):format(MAX_PUBLISH))
+                        return
+                    end
+                end
+            end
+            if n > MAX_PUBLISH then
+                Print(("Limitado a top %d para não floodar o /g."):format(MAX_PUBLISH))
+            end
+            PublishRankingToGuild(n, view)
         elseif cmd == "resetme" then
             if playerName then
-                GnomeHunterDB.kills[playerName]  = 0
-                GnomeHunterDB.kcount[playerName] = 0
+                for _, view in ipairs(SCORE_STORES) do
+                    ScoreStore(view).kills[playerName]  = 0
+                    ScoreStore(view).kcount[playerName] = 0
+                end
                 BroadcastMyScore()
                 Print("Sua contagem foi zerada.")
                 RefreshRankFrame()
@@ -1318,6 +1490,8 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         elseif cmd == "resetall" then
             GnomeHunterDB.kills  = {}
             GnomeHunterDB.kcount = {}
+            wipe(GnomeHunterDB.weekly.kills)
+            wipe(GnomeHunterDB.weekly.kcount)
             if playerName then EnsureEntry(playerName) end
             Print("Base local zerada. Use /gnomo sync para pegar os valores da guild.")
             RefreshRankFrame()
@@ -1349,6 +1523,9 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             local gb = GnomeHunterDB.guildBounty
             Print("Player bounty: " .. (pb and (pb.name.." (setAt="..tostring(pb.setAt)..")") or "nenhum"))
             Print("Guild bounty: " .. (gb and ("<"..gb.name.."> (setAt="..tostring(gb.setAt)..")") or "nenhum"))
+            EnsureWeek()
+            Print(("Semana: id=%d | zera em %s | hora do servidor=%d"):format(
+                GnomeHunterDB.weekly.weekId, FormatDuration(SecondsToWeeklyReset()), ServerNow()))
         elseif cmd == "migrate" then
             ScheduleRosterRefresh()
             local before = 0
@@ -1389,7 +1566,8 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             if count == 0 then Print("  (vazio - guild roster não carregado ou guild offline)") end
         elseif cmd == "help" or cmd == "?" then
             Print("Comandos:")
-            Print("  /gnomo                  - ranking no chat")
+            Print("  /gnomo                  - ranking SEMANAL no chat (zera terça 12:00)")
+            Print("  /gnomo geral            - ranking GERAL no chat")
             Print("  /gnomo ui               - abre/fecha janela")
             Print("  /gnomo sync             - pede valores da guild")
             Print("  /gnomo guildonly        - alterna filtro 'só membros da guild'")
@@ -1403,7 +1581,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             Print("  /gnomo bounty clear     - remove player bounty (oficial)")
             Print("  /gnomo guildbounty <nome da guild>  - define guild bounty (oficial)")
             Print("  /gnomo guildbounty clear  - remove guild bounty (oficial)")
-            Print("  /gnomo publish [N]      - envia top N (padrão 10) no chat da guild")
+            Print("  /gnomo publish [N] [geral] - envia top N (padrão 10, semanal) no chat da guild")
             Print("  /gnomo resetme          - zera sua contagem")
             Print("  /gnomo resetall         - zera base local")
             Print("  /gnomo test             - simula kill no target atual")
@@ -1412,6 +1590,43 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         else
             Print("Comando desconhecido. /gnomo help")
         end
+    end
+
+    -- =================================================================
+    -- Identificação do killer (sem combat log no Forever)
+    -- Considera o target e todas as nameplates visíveis. Só retorna um unit
+    -- se houver EXATAMENTE UM player hostil vivo mirando em você e nenhum
+    -- NPC hostil mirando em você (senão a morte provavelmente foi PvE ou
+    -- é ambígua - melhor não anunciar do que culpar a pessoa errada).
+    -- =================================================================
+    local function FindLikelyKiller()
+        local seen = {}          -- GUID -> true (target e nameplate podem ser o mesmo)
+        local playerUnit, playerCount = nil, 0
+        local npcOnMe = false
+
+        local function consider(unit)
+            if not Readable(UnitExists(unit)) then return end
+            local guid = Readable(UnitGUID(unit))
+            if type(guid) ~= "string" or seen[guid] then return end
+            seen[guid] = true
+            if not Readable(UnitCanAttack("player", unit)) then return end
+            if Readable(UnitIsDead(unit)) then return end
+            if not Readable(UnitIsUnit(unit .. "target", "player")) then return end
+            if Readable(UnitIsPlayer(unit)) then
+                playerCount = playerCount + 1
+                playerUnit = unit
+            else
+                npcOnMe = true
+            end
+        end
+
+        consider("target")
+        for i = 1, 40 do
+            consider("nameplate" .. i)
+        end
+
+        if npcOnMe or playerCount ~= 1 then return nil end
+        return playerUnit
     end
 
     -- =================================================================
@@ -1427,19 +1642,36 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             -- move os scores para o nome completo e remove a entry antiga.
             if playerName and string.find(playerName, " ") then
                 local firstOnly = string.match(playerName, "^(%S+)")
-                if firstOnly and firstOnly ~= playerName
-                   and GnomeHunterDB.kills[firstOnly] then
-                    GnomeHunterDB.kills[playerName]  = (GnomeHunterDB.kills[playerName]  or 0)
-                        + (GnomeHunterDB.kills[firstOnly]  or 0)
-                    GnomeHunterDB.kcount[playerName] = (GnomeHunterDB.kcount[playerName] or 0)
-                        + (GnomeHunterDB.kcount[firstOnly] or 0)
-                    GnomeHunterDB.kills[firstOnly]  = nil
-                    GnomeHunterDB.kcount[firstOnly] = nil
-                    Print(("Migração: '%s' -> '%s'"):format(firstOnly, playerName))
+                if firstOnly and firstOnly ~= playerName then
+                    for _, view in ipairs(SCORE_STORES) do
+                        local s = ScoreStore(view)
+                        if s.kills[firstOnly] then
+                            s.kills[playerName]  = (s.kills[playerName]  or 0) + (s.kills[firstOnly]  or 0)
+                            s.kcount[playerName] = (s.kcount[playerName] or 0) + (s.kcount[firstOnly] or 0)
+                            s.kills[firstOnly]  = nil
+                            s.kcount[firstOnly] = nil
+                            if view == "all" then
+                                Print(("Migração: '%s' -> '%s'"):format(firstOnly, playerName))
+                            end
+                        end
+                    end
                 end
             end
 
+            -- Semana pode ter virado enquanto estava offline
+            EnsureWeek()
             EnsureEntry(playerName)
+
+            -- Checa a virada da semana a cada 30s enquanto o jogo está aberto
+            if C_Timer and C_Timer.NewTicker then
+                C_Timer.NewTicker(30, function()
+                    if EnsureWeek() then
+                        EnsureEntry(playerName)
+                        Print("|cFFFFD100Novo ranking semanal começou!|r Boa caçada.")
+                    end
+                    RefreshRankFrame()  -- atualiza contagem regressiva (no-op se fechado)
+                end)
+            end
             ScheduleRosterRefresh()
             if C_Timer and C_Timer.After then
                 -- Primeira passada em 3s: anuncia meu score e pede os outros
@@ -1481,21 +1713,18 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
                 local inst = IsInInstance()
                 if inst then return end
             end
-            -- Precisa identificar o killer como player hostil, caso contrário
-            -- não anuncia (evita PvE, fall damage, DoT residual)
-            if not (UnitExists("target") and UnitIsPlayer("target")
-                    and UnitCanAttack("player", "target")
-                    and not UnitIsDead("target")) then
-                return
-            end
-            local killer = GetFullName("target")
+            -- Precisa identificar o killer com segurança, caso contrário
+            -- não anuncia (evita PvE, fall damage, DoT residual, alvo errado)
+            local killerUnit = FindLikelyKiller()
+            if not killerUnit then return end
+            local killer = GetFullName(killerUnit)
             if not killer then return end
             local killerLvl
             if UnitLevel then
-                local lvl = Readable(UnitLevel("target"))
+                local lvl = Readable(UnitLevel(killerUnit))
                 if type(lvl) == "number" and lvl > 0 then killerLvl = lvl end
             end
-            local _, englishRace = UnitRace("target")
+            local _, englishRace = UnitRace(killerUnit)
             local killerRace = Readable(englishRace)
             local me = playerName or "Alguém"
             local lvlTag = killerLvl and (" [lvl %d]"):format(killerLvl) or ""
@@ -1561,6 +1790,27 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
                     GnomeHunterDB.kills[who]  = tonumber(pts)
                     GnomeHunterDB.kcount[who] = tonumber(kc)
                     RefreshRankFrame()
+                end
+
+            elseif cmd == "WSCORE" then
+                -- v2.5.0+: WSCORE:name:weekId:pts:kcount
+                local _, _, who, wk, pts, kc = string.find(message, "^WSCORE:([^:]+):(%-?%d+):(%d+):(%d+)$")
+                if who then
+                    EnsureWeek()
+                    local w = GnomeHunterDB.weekly
+                    -- Só aceita score da semana ATUAL (score de semana passada
+                    -- de quem ficou offline na virada é descartado)
+                    if tonumber(wk) == w.weekId then
+                        local full = FindFullNameInRoster(who)
+                        if full and full ~= who then
+                            w.kills[who]  = nil
+                            w.kcount[who] = nil
+                            who = full
+                        end
+                        w.kills[who]  = tonumber(pts)
+                        w.kcount[who] = tonumber(kc)
+                        RefreshRankFrame()
+                    end
                 end
 
             elseif cmd == "REQ" then
@@ -1666,6 +1916,8 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
                 if at <= (GnomeHunterDB.resetAt or 0) then return end
                 GnomeHunterDB.kills  = {}
                 GnomeHunterDB.kcount = {}
+                wipe(GnomeHunterDB.weekly.kills)
+                wipe(GnomeHunterDB.weekly.kcount)
                 if playerName then EnsureEntry(playerName) end
                 GnomeHunterDB.resetAt = at
                 Print(("|cFFFFD100Ranking zerado pelo oficial %s.|r"):format(senderName or "?"))

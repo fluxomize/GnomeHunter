@@ -2,13 +2,14 @@
 
 Guild ranking addon for World of Warcraft: **Forever** (Interface 16001). Tracks who in your guild kills the most gnomes in world PvP, with weekly player bounties, enemy-guild tagging, proximity alerts, a guild chat announcer and a publishable ranking.
 
-Current version: **v2.4.17**
+Current version: **v2.5.0**
 
 ---
 
 ## Features
 
 ### Ranking
+- **Weekly + all-time rankings** — the weekly ranking resets every **Tuesday at 12:00 (Brasília, UTC-3)**; the all-time ranking never resets on its own. Switch between them with the `Semanal` / `Geral` tabs in the window. The week boundary uses the server clock (`GetServerTime`), so every client in the guild agrees on it.
 - **Guild-wide leaderboard** — every player with the addon broadcasts their score via an invisible guild addon channel; everyone sees the same ranking with no spam on `/g`.
 - **Kills and points tracked separately** — the UI shows raw kill count plus a "pts" breakdown (so bonus points from bounties stay visible without inflating the kill column).
 - **Automatic deduplication** — resolves short-name and full-name entries to a single player via the guild roster (keeps the maximum, never sums duplicates).
@@ -29,7 +30,7 @@ Current version: **v2.4.17**
 ### Guild chat integration (opt-in toggles)
 - **Kill announcer** (default ON): posts every gnome kill, player-bounty kill and guild-bounty kill to `/g` with the victim's level. Example: `Bollha Tall abateu o gnomo Spikebolt [lvl 42] (+1 pt)`.
 - **Death announcer** (default OFF): when you die in open-world PvP to an identified hostile player, posts a tombstone message. Skipped in dungeons/raids/BGs/arenas and on deaths with no identifiable killer (fall damage, PvE, residual DoT).
-- **Ranking publisher**: `Publicar` button in the UI or `/gnomo publish [N]` sends the top N plus active bounties to `/g`. Messages are spaced 0.35 s apart to dodge the server's rate limiter and preserve order.
+- **Ranking publisher**: `Publicar` button in the UI (publishes the selected tab) or `/gnomo publish [N] [geral]` sends the top N (max 20) of the weekly or all-time ranking plus active bounties to `/g`. Messages are spaced 0.35 s apart to dodge the server's rate limiter and preserve order.
 
 ### UI
 - Dark red themed draggable window (360 × 616) with:
@@ -61,7 +62,8 @@ Current version: **v2.4.17**
 
 | Command | Action |
 |---|---|
-| `/gnomo` | Show ranking in chat |
+| `/gnomo` | Show the weekly ranking in chat |
+| `/gnomo geral` | Show the all-time ranking in chat |
 | `/gnomo ui` | Open/close the ranking window |
 | `/gnomo sync` | Request fresh scores + bounties from the guild |
 | `/gnomo guildonly` | Toggle "guild members only" filter |
@@ -73,7 +75,7 @@ Current version: **v2.4.17**
 | `/gnomo bounty clear` | **(officers)** Remove the active player bounty |
 | `/gnomo guildbounty <guild name>` | **(officers)** Tag an enemy guild |
 | `/gnomo guildbounty clear` | **(officers)** Remove the guild tag |
-| `/gnomo publish [N]` | Post top N (default 10) + active bounties to `/g` |
+| `/gnomo publish [N] [geral]` | Post top N (default 10, max 20) of the weekly (default) or all-time ranking + active bounties to `/g` |
 | `/gnomo resetme` | Zero your own score locally |
 | `/gnomo migrate` | Consolidate short-name / full-name duplicates in the local DB |
 | `/gnomo roster` | Dump what the addon knows about the guild roster |
@@ -106,7 +108,8 @@ All synchronization traffic travels on the invisible `SendAddonMessage` channel 
 
 | Payload | Direction | Purpose |
 |---|---|---|
-| `SCORE:name:pts:kcount` | Broadcast or Whisper | A client's current score |
+| `SCORE:name:pts:kcount` | Broadcast or Whisper | A client's current all-time score |
+| `WSCORE:name:weekId:pts:kcount` | Broadcast or Whisper | A client's score for the current week (ignored if `weekId` isn't the current week) |
 | `REQ:name` | Broadcast | Asks everyone to reply with their score (replies go via Whisper) |
 | `BOUNTY:name:race:setBy:setAt` | Broadcast or Whisper | Active player bounty |
 | `BOUNTYCLR:timestamp` | Broadcast | Clears the player bounty |
