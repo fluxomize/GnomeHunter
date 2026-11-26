@@ -3,7 +3,7 @@
 ## Title: GnomeHunter
 ## Notes: Ranking de guild - quem mais matou gnomos
 
-## Version: 2.4.17
+## Version: 2.5.0
 ## Author: Fluxomize
 ## SavedVariables: GnomeHunterDB
 ## LoadSavedVariablesFirst: true
