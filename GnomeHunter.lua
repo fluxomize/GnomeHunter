@@ -163,7 +163,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     local rankFrame
     local bountyPlayerText, bountyGuildText
     local scoreText, rankText, scoreLabel
-    local tabWeek, tabAll, footerHint
+    local tabWeek, tabAll, tabEvent, footerHint, eventStateBadge, btnCreateEvent, btnCancelEvent
     local rankLines = {}
     local guildCheck, alertCheck, announceCheck
     local btnSetBounty, btnSetGuildBounty, btnReset
@@ -229,12 +229,32 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         return true
     end
 
-    -- Os dois "stores" de score têm a mesma forma: { kills = {}, kcount = {} }
+    -- Retorna o evento que deve ser mostrado na view "event":
+    -- preferência: ativo > último encerrado > nil
+    local function GetDisplayEvent()
+        if GnomeHunterDB.activeEventId then
+            return GnomeHunterDB.events[GnomeHunterDB.activeEventId]
+        end
+        if GnomeHunterDB.lastEventId then
+            return GnomeHunterDB.events[GnomeHunterDB.lastEventId]
+        end
+        return nil
+    end
+
+    -- Os stores de score têm a mesma forma: { kills = {}, kcount = {} }.
+    -- "event" retorna o store do evento ATIVO ou ÚLTIMO; se não houver
+    -- nenhum evento, devolve um store vazio e isolado.
+    local EMPTY_STORE = { kills = {}, kcount = {} }
     local function ScoreStore(view)
-        if view == "week" then return GnomeHunterDB.weekly end
+        if view == "week"  then return GnomeHunterDB.weekly end
+        if view == "event" then
+            local e = GetDisplayEvent()
+            if e then return e end
+            return EMPTY_STORE
+        end
         return GnomeHunterDB
     end
-    local SCORE_STORES = { "all", "week" }
+    local SCORE_STORES = { "all", "week" }   -- stores que RegisterKill incrementa automaticamente
 
     local function ViewLabel(view)
         if view == "week"  then return "Semanal" end
@@ -753,11 +773,12 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             r.kcount = math.max(r.kcount, store.kcount[name] or pts)
         end
         -- Etapa 2: filtra por guild e monta a lista final.
-        -- No semanal, quem tem 0 nesta semana não aparece (exceto você).
+        -- No semanal/evento, quem tem 0 pontos não aparece (exceto você).
         local list = {}
         for name, r in pairs(resolved) do
             local key = NormKey(name)
-            local hasScore = view ~= "week" or r.pts > 0 or key == playerKey
+            local hideZero = (view == "week" or view == "event")
+            local hasScore = not hideZero or r.pts > 0 or key == playerKey
             if hasScore and ((not filter) or (key and guildSet[key]) or key == playerKey) then
                 table.insert(list, { name = name, count = r.pts, kills = r.kcount })
             end
@@ -888,19 +909,52 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
 
         local view = GnomeHunterDB.opts.rankView
         EnsureWeek()
+        TickEvents()
 
-        -- abas Semanal / Geral: a ativa fica com highlight travado
-        if tabWeek and tabAll then
+        -- abas Semanal / Geral / Evento: a ativa fica com highlight travado
+        if tabWeek and tabAll and tabEvent then
+            tabWeek:UnlockHighlight(); tabAll:UnlockHighlight(); tabEvent:UnlockHighlight()
             if view == "week" then
-                tabWeek:LockHighlight(); tabAll:UnlockHighlight()
+                tabWeek:LockHighlight()
+            elseif view == "event" then
+                tabEvent:LockHighlight()
             else
-                tabAll:LockHighlight(); tabWeek:UnlockHighlight()
+                tabAll:LockHighlight()
             end
         end
+
+        -- badge do estado do evento
+        local displayEvent = GetDisplayEvent()
+        if eventStateBadge then
+            if not displayEvent then
+                eventStateBadge:SetText("")
+            elseif displayEvent.cancelled then
+                eventStateBadge:SetText("|cFFFF4040CANCELADO|r")
+            elseif displayEvent.finished then
+                eventStateBadge:SetText("|cFFAAAAAAencerrado|r")
+            elseif IsEventActiveNow(displayEvent.id) then
+                eventStateBadge:SetText(("|cFF40FF40%s|r"):format(FormatDuration(displayEvent.endAt - ServerNow())))
+            else
+                eventStateBadge:SetText(("|cFFFFA040em %s|r"):format(FormatDuration(displayEvent.startAt - ServerNow())))
+            end
+        end
+
         if footerHint then
             if view == "week" then
                 footerHint:SetText(("Semanal zera em |cFFFFD100%s|r (terça 12:00)"):format(
                     FormatDuration(SecondsToWeeklyReset())))
+            elseif view == "event" and displayEvent then
+                if IsEventActiveNow(displayEvent.id) then
+                    footerHint:SetText(("Evento |cFFFFD100'%s'|r - termina em |cFFFFD100%s|r"):format(
+                        displayEvent.name, FormatDuration(displayEvent.endAt - ServerNow())))
+                elseif displayEvent.finished then
+                    footerHint:SetText(("Último evento: |cFFFFD100'%s'|r (encerrado)"):format(displayEvent.name))
+                else
+                    footerHint:SetText(("Evento |cFFFFD100'%s'|r - inicia em |cFFFFD100%s|r"):format(
+                        displayEvent.name, FormatDuration(displayEvent.startAt - ServerNow())))
+                end
+            elseif view == "event" then
+                footerHint:SetText("|cFF888888Nenhum evento registrado|r")
             else
                 footerHint:SetText("/gnomo help  -  comandos")
             end
@@ -909,7 +963,10 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         -- score / rank do player
         local myPos, myScore, myKills = MyRankAndScore(view)
         if scoreLabel then
-            scoreLabel:SetText(view == "week" and "Semana:" or "Geral:")
+            local lbl = "Geral:"
+            if view == "week"  then lbl = "Semana:" end
+            if view == "event" then lbl = "Evento:" end
+            scoreLabel:SetText(lbl)
         end
         if scoreText then
             scoreText:SetText(("|cFFFFD100%d|r kills |cFFAAAAAA(%d pts)|r"):format(myKills, myScore))
@@ -932,6 +989,15 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         end
         if btnReset then
             if officer then btnReset:Enable() else btnReset:Disable() end
+        end
+        if btnCreateEvent then
+            if officer then btnCreateEvent:Enable() else btnCreateEvent:Disable() end
+        end
+        if btnCancelEvent then
+            local canCancel = officer and GnomeHunterDB.activeEventId and
+                              GnomeHunterDB.events[GnomeHunterDB.activeEventId] and
+                              not GnomeHunterDB.events[GnomeHunterDB.activeEventId].finished
+            if canCancel then btnCancelEvent:Enable() else btnCancelEvent:Disable() end
         end
 
         -- lista
@@ -1159,18 +1225,49 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         rankHeader:SetPoint("TOPRIGHT", -10, -294)
         rankHeader:SetHeight(20)
 
-        -- abas Semanal / Geral no lugar do título "TOP KILLERS"
+        -- abas Semanal / Geral / Evento
         local function SetView(v)
             GnomeHunterDB.opts.rankView = v
             RefreshRankFrame()
         end
-        tabWeek = MakeButton(rankFrame, "Semanal", 76, 18)
+        tabWeek = MakeButton(rankFrame, "Semanal", 62, 18)
         tabWeek:SetPoint("LEFT", rankHeader, "LEFT", 4, 0)
         tabWeek:SetScript("OnClick", function() SetView("week") end)
 
-        tabAll = MakeButton(rankFrame, "Geral", 76, 18)
-        tabAll:SetPoint("LEFT", tabWeek, "RIGHT", 4, 0)
+        tabAll = MakeButton(rankFrame, "Geral", 48, 18)
+        tabAll:SetPoint("LEFT", tabWeek, "RIGHT", 2, 0)
         tabAll:SetScript("OnClick", function() SetView("all") end)
+
+        tabEvent = MakeButton(rankFrame, "Evento", 56, 18)
+        tabEvent:SetPoint("LEFT", tabAll, "RIGHT", 2, 0)
+        tabEvent:SetScript("OnClick", function() SetView("event") end)
+        tabEvent:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_TOP")
+            local e = GetDisplayEvent()
+            if e then
+                GameTooltip:AddLine(e.name)
+                GameTooltip:AddLine(("%s -> %s"):format(FormatBRT(e.startAt), FormatBRT(e.endAt)), 0.8, 0.8, 0.8)
+                if e.cancelled then
+                    GameTooltip:AddLine("Cancelado", 1, 0.4, 0.4)
+                elseif e.finished then
+                    GameTooltip:AddLine("Encerrado", 0.7, 0.7, 0.7)
+                elseif IsEventActiveNow(e.id) then
+                    GameTooltip:AddLine(("Ativo - acaba em %s"):format(FormatDuration(e.endAt - ServerNow())), 0.4, 1, 0.4)
+                else
+                    GameTooltip:AddLine(("Comeca em %s"):format(FormatDuration(e.startAt - ServerNow())), 1, 0.65, 0.3)
+                end
+            else
+                GameTooltip:AddLine("Nenhum evento registrado")
+                GameTooltip:AddLine("Oficiais podem criar via /gnomo event create", 0.7, 0.7, 0.7)
+            end
+            GameTooltip:Show()
+        end)
+        tabEvent:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+        -- badge pequeno à direita das tabs (ATIVO / AGENDADO / ENCERRADO)
+        eventStateBadge = rankFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        eventStateBadge:SetPoint("LEFT", tabEvent, "RIGHT", 6, 0)
+        eventStateBadge:SetText("")
 
         local rhRight = rankFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         rhRight:SetPoint("RIGHT", rankHeader, "RIGHT", -10, 0)
