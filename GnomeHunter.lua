@@ -1,4 +1,4 @@
--- GnomeHunter v2.5.0 - ranking semanal (zera terça 12:00 BRT) + ranking geral
+-- GnomeHunter v2.6.0 - eventos configuráveis com data/hora início + duração (BRT)
 -- Estratégia de kill baseada no Spy (WoW Forever / Interface 16001)
 
 local BOOT = CreateFrame("Frame")
@@ -11,11 +11,20 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     -- Constantes
     -- =================================================================
     local ADDON_PREFIX   = "GNMHUNT"
-    local VERSION        = "2.5.0"
+    local VERSION        = "2.6.0"
     local BOUNTY_BONUS   = 10    -- pontos extras pelo bounty de player
     local GUILD_BONUS    = 1     -- pontos extras por matar qualquer um da guild bounty
     local ALERT_COOLDOWN = 60    -- segundos entre alertas do mesmo nome
     local MAX_PUBLISH    = 20    -- máximo de linhas de ranking no /gnomo publish
+
+    -- Eventos
+    local EVENT_NAME_MAX_LEN   = 40    -- limite de caracteres do nome
+    local EVENT_MAX_DURATION_H = 168   -- máximo de 7 dias (168h) por evento
+    local EVENT_HISTORY_MAX    = 5     -- quantos eventos encerrados manter em histórico
+    local KILLLOG_MAX          = 5000  -- rolling buffer local de kills
+
+    -- Brasília = UTC-3, sem horário de verão desde 2019
+    local BRT_OFFSET = -3 * 3600
 
     -- Ranking semanal: vira toda terça às 12:00 de Brasília (UTC-3, sem horário de
     -- verão) = terça 15:00 UTC. Âncora: terça 2024-01-02 15:00:00 UTC.
@@ -65,6 +74,23 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
 
     GnomeHunterDB.minimap = GnomeHunterDB.minimap or { angle = 0.45, hide = false }
     GnomeHunterDB.resetAt = GnomeHunterDB.resetAt or 0
+
+    -- Eventos
+    -- GnomeHunterDB.events[eventId] = {
+    --   id, name, startAt, endAt, setBy, setAt,  (metadata)
+    --   kills  = { [player] = pts  },            (agregado sincronizado)
+    --   kcount = { [player] = kcnt },
+    --   finished = bool, cancelled = bool,
+    -- }
+    GnomeHunterDB.events          = GnomeHunterDB.events          or {}
+    GnomeHunterDB.activeEventId   = GnomeHunterDB.activeEventId   or nil
+    GnomeHunterDB.lastEventId     = GnomeHunterDB.lastEventId     or nil  -- último encerrado (p/ exibição quando sem ativo)
+    GnomeHunterDB.eventHistoryIds = GnomeHunterDB.eventHistoryIds or {}   -- array FIFO dos últimos EVENT_HISTORY_MAX
+    GnomeHunterDB.eventCancelsAt  = GnomeHunterDB.eventCancelsAt  or {}   -- [eventId] = clearedAt (anti-loop)
+
+    -- Kill log local do PRÓPRIO player (rolling buffer).
+    -- Entries: { at = <serverUnix>, pts = N, race = "Gnome"|..., victim = "...", lvl = N, eventId = "..." or nil }
+    GnomeHunterDB.killLog = GnomeHunterDB.killLog or {}
 
     -- =================================================================
     -- Estado
@@ -144,6 +170,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
 
     -- Forward declaration (ScheduleRosterRefresh e outras helpers chamam antes da definição)
     local RefreshRankFrame
+    local TickEvents, AnnounceEventStart, AnnounceEventEnd
 
     -- =================================================================
     -- Helpers de valor secreto (Forever)
@@ -210,7 +237,123 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     local SCORE_STORES = { "all", "week" }
 
     local function ViewLabel(view)
-        return view == "week" and "Semanal" or "Geral"
+        if view == "week"  then return "Semanal" end
+        if view == "event" then return "Evento"  end
+        return "Geral"
+    end
+
+    -- =================================================================
+    -- Eventos (ranking configurável por oficial)
+    --
+    -- HORA DO SERVIDOR: GetServerTime() retorna unix epoch (UTC).
+    -- Internamente usamos UTC. Toda interação com o usuário usa BRT
+    -- (UTC-3, sem horário de verão). Mensagens, popups e anúncios
+    -- sempre formatam "DD/MM HH:MM BRT".
+    -- =================================================================
+
+    -- time(table) do Lua interpreta a tabela como LOCAL (do SO) e devolve epoch UTC.
+    -- Essa helper interpreta a tabela como UTC devolvendo epoch UTC, independente do SO.
+    local function UtcTableToEpoch(t)
+        -- offsetSO = quanto a LOCAL está à frente da UTC
+        -- time(date("!*t")) pega a tabela UTC "agora" e interpreta como LOCAL,
+        -- então retorna um epoch deslocado pelo offsetSO.
+        local offsetSO = time() - time(date("!*t"))
+        return time(t) - offsetSO
+    end
+
+    -- Converte "YYYY-MM-DD HH:MM" (BRT) para unix epoch UTC. nil se inválido.
+    local function ParseBRTDateTime(str)
+        if type(str) ~= "string" then return nil end
+        local Y, M, D, h, m = string.match(str, "^(%d%d%d%d)%-(%d%d)%-(%d%d)%s+(%d%d):(%d%d)$")
+        if not Y then return nil end
+        Y, M, D, h, m = tonumber(Y), tonumber(M), tonumber(D), tonumber(h), tonumber(m)
+        if not (Y and M and D and h and m) then return nil end
+        if M < 1 or M > 12 or D < 1 or D > 31 or h < 0 or h > 23 or m < 0 or m > 59 then
+            return nil
+        end
+        -- Interpreta a tabela como UTC, depois subtrai o BRT_OFFSET (-3h) para
+        -- obter o epoch UTC real: 20:00 BRT = 23:00 UTC → epoch + 3h.
+        local epochIfUtc = UtcTableToEpoch({ year = Y, month = M, day = D, hour = h, min = m, sec = 0 })
+        return epochIfUtc - BRT_OFFSET
+    end
+
+    -- Formata unix UTC como "DD/MM HH:MM BRT"
+    local function FormatBRT(utc)
+        local brt = utc + BRT_OFFSET   -- converte UTC pra "epoch como se fosse BRT"
+        -- date("!") trata como UTC, então passar brt devolve os componentes BRT
+        local t = date("!*t", brt)
+        return ("%02d/%02d %02d:%02d BRT"):format(t.day, t.month, t.hour, t.min)
+    end
+
+    -- Garante que o evento ativo ainda está dentro da janela; se expirou, encerra.
+    -- Retorna "started" (anúncio start pendente), "ended" (anúncio end pendente), ou nil.
+    -- O anúncio real é feito pelo caller (que tem acesso a SafeChat).
+    local function PollActiveEvent()
+        local now = ServerNow()
+        -- Começa um evento futuro que já chegou a hora?
+        if not GnomeHunterDB.activeEventId then
+            for id, e in pairs(GnomeHunterDB.events) do
+                if (not e.finished) and (not e.cancelled)
+                   and e.startAt <= now and now < e.endAt then
+                    GnomeHunterDB.activeEventId = id
+                    if not e.announcedStart then
+                        e.announcedStart = true
+                        return "started", e
+                    end
+                    return nil
+                end
+            end
+        else
+            local e = GnomeHunterDB.events[GnomeHunterDB.activeEventId]
+            if not e or e.cancelled then
+                GnomeHunterDB.activeEventId = nil
+                return nil
+            end
+            if now >= e.endAt then
+                e.finished = true
+                GnomeHunterDB.lastEventId = GnomeHunterDB.activeEventId
+                GnomeHunterDB.activeEventId = nil
+                if not e.announcedEnd then
+                    e.announcedEnd = true
+                    return "ended", e
+                end
+            end
+        end
+        return nil
+    end
+
+    -- true se o evento ID está ativo AGORA (dentro da janela)
+    local function IsEventActiveNow(eventId)
+        local e = eventId and GnomeHunterDB.events[eventId]
+        if not e or e.cancelled or e.finished then return false end
+        local now = ServerNow()
+        return e.startAt <= now and now < e.endAt
+    end
+
+    -- Gera um ID único para novo evento
+    local function NewEventId()
+        return ("evt_%d_%d"):format(ServerNow(), math.random(0, 9999))
+    end
+
+    -- Mantém o histórico limitado aos EVENT_HISTORY_MAX mais recentes
+    local function PruneEventHistory()
+        local ids = GnomeHunterDB.eventHistoryIds
+        while #ids > EVENT_HISTORY_MAX do
+            local oldest = table.remove(ids, 1)
+            if oldest and oldest ~= GnomeHunterDB.activeEventId and oldest ~= GnomeHunterDB.lastEventId then
+                GnomeHunterDB.events[oldest] = nil
+            end
+        end
+    end
+
+    -- Append-only ao kill log local, com prune do tamanho
+    local function AppendKillLog(entry)
+        local log = GnomeHunterDB.killLog
+        log[#log + 1] = entry
+        if #log > KILLLOG_MAX then
+            -- remove a entrada mais antiga preservando ordem (tira do início)
+            table.remove(log, 1)
+        end
     end
 
     local function EnsureEntry(name)
@@ -294,6 +437,36 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     local function BroadcastGuildBountyClear()
         Broadcast("GBCLR:" .. (GnomeHunterDB.guildBountyClearedAt or time()))
     end
+
+    -- Envia metadata de um evento (oficial). Formato:
+    -- EVENT:id:startAt:endAt:setBy:setAt:name
+    -- Nome é o ÚLTIMO campo porque é o único com conteúdo livre (pode ter ':' ou não).
+    local function SendEvent(target, eventId)
+        local e = eventId and GnomeHunterDB.events[eventId]
+        if not e then return end
+        -- Nome sanitizado: troca ':' por ' ' pra não colidir com separador do protocolo
+        local safeName = string.gsub(e.name or "", ":", " ")
+        local payload = ("EVENT:%s:%d:%d:%s:%d:%s"):format(
+            e.id, e.startAt, e.endAt, e.setBy or "?", e.setAt or 0, safeName)
+        if target then Whisper(payload, target) else Broadcast(payload) end
+    end
+    local function BroadcastEvent(eventId) SendEvent(nil, eventId) end
+    local function BroadcastEventClear(eventId)
+        local at = GnomeHunterDB.eventCancelsAt[eventId] or time()
+        Broadcast(("EVENTCLR:%s:%d"):format(eventId, at))
+    end
+
+    -- Envia meu score em um evento específico (agregado)
+    local function SendEventScore(target, eventId)
+        if not playerName then return end
+        local e = eventId and GnomeHunterDB.events[eventId]
+        if not e then return end
+        local pts = (e.kills and e.kills[playerName]) or 0
+        local kc  = (e.kcount and e.kcount[playerName]) or 0
+        local payload = ("ESCORE:%s:%s:%d:%d"):format(eventId, playerName, pts, kc)
+        if target then Whisper(payload, target) else Broadcast(payload) end
+    end
+    local function BroadcastMyEventScore(eventId) SendEventScore(nil, eventId) end
 
     -- =================================================================
     -- Guild roster  (GuildRoster() é ASSÍNCRONO: pede ao server, resposta
@@ -488,6 +661,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         if pts == 0 then return end
 
         EnsureWeek()
+        TickEvents()  -- atualiza activeEventId antes de incrementar
         EnsureEntry(playerName)
         for _, view in ipairs(SCORE_STORES) do
             local s = ScoreStore(view)
@@ -495,6 +669,26 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             s.kcount[playerName] = (s.kcount[playerName] or 0) + 1
         end
         local w = GnomeHunterDB.weekly
+
+        -- Se há evento ativo, também incrementa o store dele
+        local activeId = GnomeHunterDB.activeEventId
+        local activeEvent = activeId and GnomeHunterDB.events[activeId]
+        if activeEvent and IsEventActiveNow(activeId) then
+            activeEvent.kills[playerName]  = (activeEvent.kills[playerName]  or 0) + pts
+            activeEvent.kcount[playerName] = (activeEvent.kcount[playerName] or 0) + 1
+        else
+            activeId = nil  -- não há evento válido pra esse kill
+        end
+
+        -- Append no kill log local (histórico individual)
+        AppendKillLog({
+            at      = ServerNow(),
+            pts     = pts,
+            race    = victimRace,
+            victim  = victimName,
+            lvl     = victimLevel,
+            eventId = activeId,
+        })
 
         -- mensagem por prioridade
         local tag
@@ -512,6 +706,9 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
                   w.kcount[playerName], w.kills[playerName],
                   GnomeHunterDB.kcount[playerName], GnomeHunterDB.kills[playerName]))
         BroadcastMyScore()
+        if activeId then
+            BroadcastMyEventScore(activeId)
+        end
 
         -- Anuncia o kill no chat da guild
         if GnomeHunterDB.opts.announce and IsInGuild() then
@@ -1239,6 +1436,108 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     end
 
     -- =================================================================
+    -- Eventos: cria, cancela e anuncia
+    -- =================================================================
+    AnnounceEventStart = function(e)
+        if not IsInGuild() then return end
+        local msg = (">> Evento '%s' comecou! Vale ate %s (contagem exclusiva deste evento no ranking)"):format(
+            e.name, FormatBRT(e.endAt))
+        SafeChat(msg, "GUILD")
+    end
+
+    AnnounceEventEnd = function(e)
+        if not IsInGuild() then return end
+        -- Procura o vencedor nos agregados do evento
+        local topName, topPts, topKcnt = nil, -1, 0
+        for name, pts in pairs(e.kills or {}) do
+            if pts > topPts then
+                topName, topPts, topKcnt = name, pts, (e.kcount and e.kcount[name]) or 0
+            end
+        end
+        local msg
+        if topName and topPts > 0 then
+            msg = (">> Evento '%s' encerrado! Campeao: %s com %d kills (%d pts)"):format(
+                e.name, topName, topKcnt, topPts)
+        else
+            msg = (">> Evento '%s' encerrado sem kills registrados."):format(e.name)
+        end
+        SafeChat(msg, "GUILD")
+    end  -- AnnounceEventEnd
+
+    -- Verifica mudança de estado do evento e dispara anúncio quando necessário.
+    -- Chamada periodicamente pelo ticker + no login + nos handlers de rede.
+    TickEvents = function()
+        local change, e = PollActiveEvent()
+        if change == "started" then
+            AnnounceEventStart(e)
+        elseif change == "ended" then
+            AnnounceEventEnd(e)
+        end
+    end
+
+    -- Cria evento (chamador já validou que é oficial). startAt é unix UTC.
+    -- durationH é em horas (número positivo). name já veio truncado e validado.
+    -- Retorna o eventId ou nil + razão.
+    local function CreateEvent(name, startAt, durationH, setBy)
+        if type(name) ~= "string" or name == "" then
+            return nil, "Nome obrigatório."
+        end
+        if #name > EVENT_NAME_MAX_LEN then
+            name = string.sub(name, 1, EVENT_NAME_MAX_LEN)
+        end
+        if type(startAt) ~= "number" or type(durationH) ~= "number" then
+            return nil, "Datahora ou duração inválidas."
+        end
+        if durationH <= 0 or durationH > EVENT_MAX_DURATION_H then
+            return nil, ("Duração deve ser entre 0 e %d horas."):format(EVENT_MAX_DURATION_H)
+        end
+        local endAt = startAt + math.floor(durationH * 3600)
+        if endAt <= ServerNow() then
+            return nil, "Evento já estaria encerrado (verifique a data/hora)."
+        end
+        local id = NewEventId()
+        local e = {
+            id      = id,
+            name    = name,
+            startAt = startAt,
+            endAt   = endAt,
+            setBy   = setBy or playerName or "?",
+            setAt   = ServerNow(),
+            kills   = {},
+            kcount  = {},
+        }
+        GnomeHunterDB.events[id] = e
+        table.insert(GnomeHunterDB.eventHistoryIds, id)
+        PruneEventHistory()
+        -- Se um outro evento ainda estava marcado como ativo, cancela — só 1 por vez.
+        if GnomeHunterDB.activeEventId and GnomeHunterDB.activeEventId ~= id then
+            local old = GnomeHunterDB.events[GnomeHunterDB.activeEventId]
+            if old and not old.finished then
+                old.cancelled = true
+                GnomeHunterDB.eventCancelsAt[old.id] = ServerNow()
+            end
+            GnomeHunterDB.activeEventId = nil
+        end
+        Print(("|cFFFFD100Evento criado:|r '%s' (%s -> %s)"):format(
+            e.name, FormatBRT(e.startAt), FormatBRT(e.endAt)))
+        TickEvents()  -- em caso de start imediato
+        return id
+    end
+
+    local function CancelEvent(id)
+        local e = id and GnomeHunterDB.events[id]
+        if not e then return false end
+        e.cancelled = true
+        GnomeHunterDB.eventCancelsAt[id] = ServerNow()
+        if GnomeHunterDB.activeEventId == id then
+            GnomeHunterDB.activeEventId = nil
+            GnomeHunterDB.lastEventId = id
+        end
+        Print(("|cFFFFD100Evento '%s' cancelado.|r"):format(e.name or id))
+        return true
+    end
+
+    -- =================================================================
     -- Static popups (dialogs seguros do Blizzard)
     -- No retail moderno (Forever) a propriedade é EditBox; na vanilla era editBox.
     -- =================================================================
@@ -1457,6 +1756,89 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
                 SetGuildBounty(orig, playerName)
                 BroadcastGuildBounty()
             end
+        elseif cmd == "event" or cmd == "evento" then
+            -- Parse pela string original (preserva case e o nome entre aspas)
+            local origRest = string.match(msg, "^%S+%s+(.*)$") or ""
+            local sub = string.match(string.lower(origRest), "^(%S+)")
+            if not sub or sub == "" or sub == "help" or sub == "?" then
+                Print("|cFFFFD100Comandos de evento:|r")
+                Print("  /gnomo event create \"Nome do evento\" YYYY-MM-DD HH:MM <horas>")
+                Print("     ex: /gnomo event create \"Raid em SG\" 2026-11-28 20:00 2")
+                Print("     (data/hora no fuso de BRASÍLIA - BRT, UTC-3)")
+                Print("  /gnomo event cancel     - cancela o evento ativo (oficial)")
+                Print("  /gnomo event info       - mostra o evento ativo/último")
+            elseif sub == "create" or sub == "criar" or sub == "novo" then
+                if not IsGuildOfficer() then
+                    Print("Só oficiais podem criar eventos.")
+                    return
+                end
+                -- origRest sem o "create "
+                local args = string.match(origRest, "^%S+%s+(.*)$") or ""
+                -- Extrai nome entre aspas: "..." ou '...'
+                local name, after = string.match(args, "^%s*\"(.-)\"%s*(.*)$")
+                if not name then
+                    name, after = string.match(args, "^%s*'(.-)'%s*(.*)$")
+                end
+                if not name then
+                    Print("|cFFFF8080Uso:|r /gnomo event create \"Nome\" YYYY-MM-DD HH:MM <horas>")
+                    return
+                end
+                local dstr, tstr, durStr = string.match(after, "^(%d%d%d%d%-%d%d%-%d%d)%s+(%d%d:%d%d)%s+(%S+)$")
+                if not dstr then
+                    Print("|cFFFF8080Uso:|r /gnomo event create \"Nome\" YYYY-MM-DD HH:MM <horas>")
+                    Print("     ex: /gnomo event create \"Raid em SG\" 2026-11-28 20:00 2")
+                    return
+                end
+                local startAt = ParseBRTDateTime(dstr .. " " .. tstr)
+                local dur = tonumber(durStr)
+                if not startAt then
+                    Print("|cFFFF8080Data/hora inválida. Formato: YYYY-MM-DD HH:MM (hora de Brasília).|r")
+                    return
+                end
+                if not dur or dur <= 0 then
+                    Print("|cFFFF8080Duração deve ser um número positivo de horas.|r")
+                    return
+                end
+                local id, err = CreateEvent(name, startAt, dur, playerName)
+                if not id then
+                    Print("|cFFFF8080" .. (err or "Erro ao criar evento") .. "|r")
+                    return
+                end
+                BroadcastEvent(id)
+            elseif sub == "cancel" or sub == "cancelar" then
+                if not IsGuildOfficer() then
+                    Print("Só oficiais podem cancelar eventos.")
+                    return
+                end
+                local id = GnomeHunterDB.activeEventId or GnomeHunterDB.lastEventId
+                if not id or not GnomeHunterDB.events[id] or GnomeHunterDB.events[id].finished then
+                    Print("Não há evento ativo para cancelar.")
+                    return
+                end
+                if CancelEvent(id) then
+                    BroadcastEventClear(id)
+                end
+            elseif sub == "info" or sub == "status" then
+                local id = GnomeHunterDB.activeEventId or GnomeHunterDB.lastEventId
+                local e = id and GnomeHunterDB.events[id]
+                if not e then
+                    Print("Nenhum evento registrado ainda.")
+                    return
+                end
+                local state
+                if e.cancelled then state = "|cFFFF4040CANCELADO|r"
+                elseif e.finished then state = "|cFFAAAAAAencerrado|r"
+                elseif IsEventActiveNow(id) then state = "|cFF40FF40ATIVO|r"
+                else state = "|cFFFFAA40aguardando início|r" end
+                Print(("|cFFFFD100Evento:|r '%s' (%s)"):format(e.name, state))
+                Print(("  início: %s | fim: %s"):format(FormatBRT(e.startAt), FormatBRT(e.endAt)))
+                Print(("  criado por: %s"):format(e.setBy or "?"))
+                local nParticipants = 0
+                for _ in pairs(e.kills or {}) do nParticipants = nParticipants + 1 end
+                Print(("  participantes com kills: %d"):format(nParticipants))
+            else
+                Print("Subcomando desconhecido. Use: /gnomo event help")
+            end
         elseif cmd == "publish" or cmd == "publicar" or cmd == "share" then
             -- /gnomo publish [N] [semana|geral]  (ordem livre; padrão: 10, semanal)
             local n, view = 10, "week"
@@ -1581,6 +1963,9 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             Print("  /gnomo bounty clear     - remove player bounty (oficial)")
             Print("  /gnomo guildbounty <nome da guild>  - define guild bounty (oficial)")
             Print("  /gnomo guildbounty clear  - remove guild bounty (oficial)")
+            Print("  /gnomo event create \"Nome\" YYYY-MM-DD HH:MM <horas> - cria evento em horário BRT (oficial)")
+            Print("  /gnomo event cancel     - cancela evento ativo (oficial)")
+            Print("  /gnomo event info       - mostra status do evento atual")
             Print("  /gnomo publish [N] [geral] - envia top N (padrão 10, semanal) no chat da guild")
             Print("  /gnomo resetme          - zera sua contagem")
             Print("  /gnomo resetall         - zera base local")
@@ -1662,13 +2047,14 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             EnsureWeek()
             EnsureEntry(playerName)
 
-            -- Checa a virada da semana a cada 30s enquanto o jogo está aberto
+            -- Checa a virada da semana + estado de evento a cada 30s
             if C_Timer and C_Timer.NewTicker then
                 C_Timer.NewTicker(30, function()
                     if EnsureWeek() then
                         EnsureEntry(playerName)
                         Print("|cFFFFD100Novo ranking semanal começou!|r Boa caçada.")
                     end
+                    TickEvents()        -- detecta start/end automático de eventos
                     RefreshRankFrame()  -- atualiza contagem regressiva (no-op se fechado)
                 end)
             end
@@ -1681,6 +2067,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
                         Broadcast("REQ:" .. playerName)    -- peço os deles (resposta via WHISPER)
                         Broadcast("BOUNTYREQ:")
                         Broadcast("GBREQ:")
+                        Broadcast("EVENTREQ:")
                     end
                 end)
                 -- Segunda passada em 15s: re-tenta caso alguém tenha falhado o whisper
@@ -1906,6 +2293,91 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
                 if IsGuildOfficer() and GnomeHunterDB.guildBounty then
                     SendGuildBounty(sender)
                 end
+
+            -- EVENTOS - só oficiais podem anunciar/cancelar
+            elseif cmd == "EVENT" then
+                if not IsRosterOfficer(senderName) then return end
+                -- EVENT:id:startAt:endAt:setBy:setAt:name
+                local _, _, eid, sAt, eAt, sBy, sTime, ename =
+                    string.find(message, "^EVENT:([^:]+):(%d+):(%d+):([^:]+):(%d+):(.+)$")
+                if not eid then return end
+                sAt, eAt, sTime = tonumber(sAt), tonumber(eAt), tonumber(sTime)
+                if not (sAt and eAt and sTime) or eAt <= sAt then return end
+                local existing = GnomeHunterDB.events[eid]
+                -- Rejeita se já cancelamos este eventId com timestamp mais novo
+                local cancelAt = GnomeHunterDB.eventCancelsAt[eid]
+                if cancelAt and cancelAt >= sTime then return end
+                -- Só aceita update se é mais novo
+                if existing and existing.setAt and existing.setAt > sTime then return end
+                GnomeHunterDB.events[eid] = {
+                    id       = eid,
+                    name     = ename,
+                    startAt  = sAt,
+                    endAt    = eAt,
+                    setBy    = sBy,
+                    setAt    = sTime,
+                    kills    = (existing and existing.kills)  or {},
+                    kcount   = (existing and existing.kcount) or {},
+                    finished = false,
+                    cancelled = false,
+                    announcedStart = existing and existing.announcedStart or false,
+                    announcedEnd   = existing and existing.announcedEnd   or false,
+                }
+                if not existing then
+                    table.insert(GnomeHunterDB.eventHistoryIds, eid)
+                    PruneEventHistory()
+                    Print(("|cFFFFD100Novo evento da guild:|r '%s' (ate %s) por %s"):format(
+                        ename, FormatBRT(eAt), sBy or "?"))
+                end
+                TickEvents()
+                RefreshRankFrame()
+
+            elseif cmd == "EVENTCLR" then
+                if not IsRosterOfficer(senderName) then return end
+                local _, _, eid, clrAt = string.find(message, "^EVENTCLR:([^:]+):(%d+)$")
+                clrAt = tonumber(clrAt)
+                if not (eid and clrAt) then return end
+                local e = GnomeHunterDB.events[eid]
+                if e and e.setAt and e.setAt > clrAt then return end
+                GnomeHunterDB.eventCancelsAt[eid] = math.max(
+                    GnomeHunterDB.eventCancelsAt[eid] or 0, clrAt)
+                if e then
+                    e.cancelled = true
+                    if GnomeHunterDB.activeEventId == eid then
+                        GnomeHunterDB.activeEventId = nil
+                    end
+                    Print(("|cFFFFD100Evento '%s' cancelado por oficial.|r"):format(e.name or eid))
+                    RefreshRankFrame()
+                end
+
+            elseif cmd == "EVENTREQ" then
+                -- Oficiais respondem com o evento ativo atual (via whisper)
+                if IsGuildOfficer() and GnomeHunterDB.activeEventId then
+                    SendEvent(sender, GnomeHunterDB.activeEventId)
+                end
+                -- Todos (não só oficiais) também respondem com seu ESCORE do evento ativo
+                if GnomeHunterDB.activeEventId then
+                    SendEventScore(sender, GnomeHunterDB.activeEventId)
+                end
+
+            elseif cmd == "ESCORE" then
+                -- ESCORE:eventId:player:pts:kcount
+                local _, _, eid, who, pts, kc =
+                    string.find(message, "^ESCORE:([^:]+):([^:]+):(%d+):(%d+)$")
+                if not eid then return end
+                local e = GnomeHunterDB.events[eid]
+                if not e or e.cancelled then return end
+                -- Normalize nome via roster
+                local full = FindFullNameInRoster(who)
+                if full and full ~= who then
+                    if e.kills[who]  then e.kills[who]  = nil end
+                    if e.kcount[who] then e.kcount[who] = nil end
+                    who = full
+                end
+                -- Mesma política de MAX usada no SCORE/WSCORE
+                e.kills[who]  = math.max(e.kills[who]  or 0, tonumber(pts) or 0)
+                e.kcount[who] = math.max(e.kcount[who] or 0, tonumber(kc)  or 0)
+                RefreshRankFrame()
 
             -- Reset global - só aceita de oficial e com timestamp mais novo que o último reset
             elseif cmd == "RESETALL" then
