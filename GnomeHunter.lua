@@ -1,4 +1,4 @@
--- GnomeHunter v2.7.0 - sync do ranking inteiro (inclui quem está offline) com merge por MAX
+-- GnomeHunter v2.8.0 - UI completa de eventos (tab Evento + badge + popup de criação)
 -- Estratégia de kill baseada no Spy (WoW Forever / Interface 16001)
 
 local BOOT = CreateFrame("Frame")
@@ -11,7 +11,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     -- Constantes
     -- =================================================================
     local ADDON_PREFIX   = "GNMHUNT"
-    local VERSION        = "2.7.0"
+    local VERSION        = "2.8.0"
     local BOUNTY_BONUS   = 10    -- pontos extras pelo bounty de player
     local GUILD_BONUS    = 1     -- pontos extras por matar qualquer um da guild bounty
     local ALERT_COOLDOWN = 60    -- segundos entre alertas do mesmo nome
@@ -173,15 +173,16 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     local rankFrame
     local bountyPlayerText, bountyGuildText
     local scoreText, rankText, scoreLabel
-    local tabWeek, tabAll, footerHint
+    local tabWeek, tabAll, tabEvent, eventStateBadge, footerHint
     local rankLines = {}
     local guildCheck, alertCheck, announceCheck
     local btnSetBounty, btnSetGuildBounty, btnClearBounty, btnReset
-    local btnPublish, btnHelp
+    local btnPublish, btnHelp, btnCreateEvent, btnCancelEvent
 
     -- Forward declaration (ScheduleRosterRefresh e outras helpers chamam antes da definição)
     local RefreshRankFrame
     local TickEvents, AnnounceEventStart, AnnounceEventEnd
+    local ShowCreateEventFrame  -- declarado depois dos StaticPopupDialogs
 
     -- =================================================================
     -- Helpers de valor secreto (Forever)
@@ -240,11 +241,33 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         return true
     end
 
-    -- Os dois "stores" de score têm a mesma forma: { kills = {}, kcount = {} }
+    -- Retorna o evento que deve aparecer na aba "Evento":
+    -- preferência: ativo > último encerrado > nil
+    local function GetDisplayEvent()
+        if GnomeHunterDB.activeEventId then
+            return GnomeHunterDB.events[GnomeHunterDB.activeEventId]
+        end
+        if GnomeHunterDB.lastEventId then
+            return GnomeHunterDB.events[GnomeHunterDB.lastEventId]
+        end
+        return nil
+    end
+
+    -- Store de score por view: "week" (semanal), "event" (evento em exibição) ou "all".
+    -- "event" devolve o store do evento ativo/último; se não houver nenhum,
+    -- um store vazio isolado pra UI renderizar "sem dados".
+    local EMPTY_STORE = { kills = {}, kcount = {} }
     local function ScoreStore(view)
-        if view == "week" then return GnomeHunterDB.weekly end
+        if view == "week"  then return GnomeHunterDB.weekly end
+        if view == "event" then
+            local e = GetDisplayEvent()
+            if e then return e end
+            return EMPTY_STORE
+        end
         return GnomeHunterDB
     end
+    -- stores que RegisterKill incrementa automaticamente (evento é separado:
+    -- depende de ser o ativo no momento do kill)
     local SCORE_STORES = { "all", "week" }
 
     local function ViewLabel(view)
@@ -895,7 +918,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     -- =================================================================
     -- Ranking
     -- =================================================================
-    -- view: "week" (semanal) ou "all" (geral)
+    -- view: "week" (semanal), "event" (evento ativo/último) ou "all" (geral)
     local function BuildRankingList(view)
         local store = ScoreStore(view)
         if view == "week" then EnsureWeek() end
@@ -915,11 +938,12 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             r.kcount = math.max(r.kcount, store.kcount[name] or pts)
         end
         -- Etapa 2: filtra por guild e monta a lista final.
-        -- No semanal, quem tem 0 nesta semana não aparece (exceto você).
+        -- No semanal/evento, quem tem 0 pontos não aparece (exceto você).
         local list = {}
         for name, r in pairs(resolved) do
             local key = NormKey(name)
-            local hasScore = view ~= "week" or r.pts > 0 or key == playerKey
+            local hideZero = (view == "week" or view == "event")
+            local hasScore = not hideZero or r.pts > 0 or key == playerKey
             if hasScore and ((not filter) or (key and guildSet[key]) or key == playerKey) then
                 table.insert(list, { name = name, count = r.pts, kills = r.kcount })
             end
@@ -1050,19 +1074,54 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
 
         local view = GnomeHunterDB.opts.rankView
         EnsureWeek()
+        TickEvents()  -- atualiza activeEventId antes do refresh
 
-        -- abas Semanal / Geral: a ativa fica com highlight travado
-        if tabWeek and tabAll then
+        -- abas Semanal / Geral / Evento: a ativa fica com highlight travado
+        if tabWeek and tabAll and tabEvent then
+            tabWeek:UnlockHighlight(); tabAll:UnlockHighlight(); tabEvent:UnlockHighlight()
             if view == "week" then
-                tabWeek:LockHighlight(); tabAll:UnlockHighlight()
+                tabWeek:LockHighlight()
+            elseif view == "event" then
+                tabEvent:LockHighlight()
             else
-                tabAll:LockHighlight(); tabWeek:UnlockHighlight()
+                tabAll:LockHighlight()
             end
         end
+
+        -- badge do estado do evento (à direita das tabs)
+        local displayEvent = GetDisplayEvent()
+        if eventStateBadge then
+            if not displayEvent then
+                eventStateBadge:SetText("")
+            elseif displayEvent.cancelled then
+                eventStateBadge:SetText("|cFFFF4040CANCELADO|r")
+            elseif displayEvent.finished then
+                eventStateBadge:SetText("|cFFAAAAAAencerrado|r")
+            elseif IsEventActiveNow(displayEvent.id) then
+                eventStateBadge:SetText(("|cFF40FF40%s|r"):format(FormatDuration(displayEvent.endAt - ServerNow())))
+            else
+                eventStateBadge:SetText(("|cFFFFA040em %s|r"):format(FormatDuration(displayEvent.startAt - ServerNow())))
+            end
+        end
+
         if footerHint then
             if view == "week" then
                 footerHint:SetText(("Semanal zera em |cFFFFD100%s|r (terça 12:00)"):format(
                     FormatDuration(SecondsToWeeklyReset())))
+            elseif view == "event" and displayEvent then
+                if IsEventActiveNow(displayEvent.id) then
+                    footerHint:SetText(("Evento |cFFFFD100'%s'|r - termina em |cFFFFD100%s|r"):format(
+                        displayEvent.name, FormatDuration(displayEvent.endAt - ServerNow())))
+                elseif displayEvent.finished then
+                    footerHint:SetText(("Último evento: |cFFFFD100'%s'|r (encerrado)"):format(displayEvent.name))
+                elseif displayEvent.cancelled then
+                    footerHint:SetText(("Último evento: |cFFFFD100'%s'|r (cancelado)"):format(displayEvent.name))
+                else
+                    footerHint:SetText(("Evento |cFFFFD100'%s'|r - inicia em |cFFFFD100%s|r"):format(
+                        displayEvent.name, FormatDuration(displayEvent.startAt - ServerNow())))
+                end
+            elseif view == "event" then
+                footerHint:SetText("|cFF888888Nenhum evento registrado|r")
             else
                 footerHint:SetText("/gnomo help  -  comandos")
             end
@@ -1071,7 +1130,10 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         -- score / rank do player
         local myPos, myScore, myKills = MyRankAndScore(view)
         if scoreLabel then
-            scoreLabel:SetText(view == "week" and "Semana:" or "Geral:")
+            local lbl = "Geral:"
+            if view == "week"  then lbl = "Semana:" end
+            if view == "event" then lbl = "Evento:" end
+            scoreLabel:SetText(lbl)
         end
         if scoreText then
             scoreText:SetText(("|cFFFFD100%d|r kills |cFFAAAAAA(%d pts)|r"):format(myKills, myScore))
@@ -1084,10 +1146,18 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             end
         end
 
-        -- botões de bounty/reset só aparecem para oficiais
+        -- botões de bounty/reset/evento só aparecem para oficiais
         local officer = IsGuildOfficer()
         for _, btn in ipairs({ btnSetBounty, btnSetGuildBounty, btnClearBounty, btnReset }) do
             btn:SetShown(officer)
+        end
+        if btnCreateEvent then btnCreateEvent:SetShown(officer) end
+        if btnCancelEvent then
+            local hasActive = GnomeHunterDB.activeEventId
+                and GnomeHunterDB.events[GnomeHunterDB.activeEventId]
+                and not GnomeHunterDB.events[GnomeHunterDB.activeEventId].finished
+                and not GnomeHunterDB.events[GnomeHunterDB.activeEventId].cancelled
+            btnCancelEvent:SetShown(officer and hasActive)
         end
         -- Help ocupa o lugar do Reset quando ele está escondido
         btnHelp:ClearAllPoints()
@@ -1323,13 +1393,71 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             GnomeHunterDB.opts.rankView = v
             RefreshRankFrame()
         end
-        tabWeek = MakeButton(rankFrame, "Semanal", 76, 18)
+        tabWeek = MakeButton(rankFrame, "Semanal", 62, 18)
         tabWeek:SetPoint("LEFT", rankHeader, "LEFT", 4, 0)
         tabWeek:SetScript("OnClick", function() SetView("week") end)
 
-        tabAll = MakeButton(rankFrame, "Geral", 76, 18)
-        tabAll:SetPoint("LEFT", tabWeek, "RIGHT", 4, 0)
+        tabAll = MakeButton(rankFrame, "Geral", 48, 18)
+        tabAll:SetPoint("LEFT", tabWeek, "RIGHT", 2, 0)
         tabAll:SetScript("OnClick", function() SetView("all") end)
+
+        tabEvent = MakeButton(rankFrame, "Evento", 56, 18)
+        tabEvent:SetPoint("LEFT", tabAll, "RIGHT", 2, 0)
+        tabEvent:SetScript("OnClick", function() SetView("event") end)
+        tabEvent:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_TOP")
+            local e = GetDisplayEvent()
+            if e then
+                GameTooltip:AddLine(e.name)
+                GameTooltip:AddLine(("%s -> %s"):format(FormatBRT(e.startAt), FormatBRT(e.endAt)), 0.8, 0.8, 0.8)
+                if e.cancelled then
+                    GameTooltip:AddLine("Cancelado", 1, 0.4, 0.4)
+                elseif e.finished then
+                    GameTooltip:AddLine("Encerrado", 0.7, 0.7, 0.7)
+                elseif IsEventActiveNow(e.id) then
+                    GameTooltip:AddLine(("Ativo - acaba em %s"):format(FormatDuration(e.endAt - ServerNow())), 0.4, 1, 0.4)
+                else
+                    GameTooltip:AddLine(("Comeca em %s"):format(FormatDuration(e.startAt - ServerNow())), 1, 0.65, 0.3)
+                end
+            else
+                GameTooltip:AddLine("Nenhum evento registrado")
+                GameTooltip:AddLine("Oficiais podem criar via botao '+ Novo' ou /gnomo event create", 0.7, 0.7, 0.7)
+            end
+            GameTooltip:Show()
+        end)
+        tabEvent:SetScript("OnLeave", function() GameTooltip:Hide() end)
+
+        -- badge pequeno à direita das tabs (ATIVO / AGENDADO / ENCERRADO)
+        eventStateBadge = rankFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        eventStateBadge:SetPoint("LEFT", tabEvent, "RIGHT", 6, 0)
+        eventStateBadge:SetText("")
+
+        -- Botões de criar/cancelar evento (só oficial, à direita do badge)
+        btnCreateEvent = MakeButton(rankFrame, "+ Novo", 56, 18)
+        btnCreateEvent:SetPoint("LEFT", eventStateBadge, "RIGHT", 6, 0)
+        btnCreateEvent:SetScript("OnClick", ShowCreateEventFrame)
+        btnCreateEvent:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_TOP")
+            GameTooltip:AddLine("Criar um novo evento")
+            GameTooltip:AddLine("Oficiais apenas - hora de Brasilia (BRT)", 0.8, 0.8, 0.8)
+            GameTooltip:Show()
+        end)
+        btnCreateEvent:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        btnCreateEvent:Hide()  -- RefreshRankFrame controla visibilidade
+
+        btnCancelEvent = MakeButton(rankFrame, "Cancelar", 62, 18)
+        btnCancelEvent:SetPoint("LEFT", btnCreateEvent, "RIGHT", 2, 0)
+        btnCancelEvent:SetScript("OnClick", function()
+            StaticPopup_Show("GNOMEHUNTER_CANCELEVENT")
+        end)
+        btnCancelEvent:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_TOP")
+            GameTooltip:AddLine("Cancelar o evento ativo")
+            GameTooltip:AddLine("Oficiais apenas", 0.8, 0.8, 0.8)
+            GameTooltip:Show()
+        end)
+        btnCancelEvent:SetScript("OnLeave", function() GameTooltip:Hide() end)
+        btnCancelEvent:Hide()
 
         local rhRight = rankFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
         rhRight:SetPoint("RIGHT", rankHeader, "RIGHT", -10, 0)
@@ -1505,6 +1633,21 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             end
             if not (pb and pb.name) and not (gb and gb.name) then
                 GameTooltip:AddLine("Sem bounty ativo", 0.6, 0.6, 0.6)
+            end
+            -- Evento em exibição
+            local ev = GetDisplayEvent()
+            if ev then
+                if IsEventActiveNow(ev.id) then
+                    GameTooltip:AddLine(("Evento ATIVO: %s (acaba em %s)"):format(
+                        ev.name, FormatDuration(ev.endAt - ServerNow())), 0.4, 1, 0.4)
+                elseif ev.finished then
+                    GameTooltip:AddLine(("Ultimo evento: %s (encerrado)"):format(ev.name), 0.7, 0.7, 0.7)
+                elseif ev.cancelled then
+                    GameTooltip:AddLine(("Ultimo evento: %s (cancelado)"):format(ev.name), 1, 0.4, 0.4)
+                else
+                    GameTooltip:AddLine(("Evento: %s (inicia em %s)"):format(
+                        ev.name, FormatDuration(ev.startAt - ServerNow())), 1, 0.65, 0.3)
+                end
             end
             GameTooltip:AddLine(("Alertas: %s"):format(GnomeHunterDB.opts.bountyAlerts and "ON" or "OFF"), 0.8, 0.8, 0.8)
             GameTooltip:AddLine(" ")
@@ -1809,6 +1952,182 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             -- broadcast para a guild
             Broadcast("RESETALL:" .. at)
             RefreshRankFrame()
+        end,
+        timeout = 0, whileDead = 1, hideOnEscape = 1, preferredIndex = 3,
+    }
+
+    -- =================================================================
+    -- Frame customizado "Criar Evento" (StaticPopup só suporta 1 EditBox)
+    -- =================================================================
+    local createEventFrame
+    ShowCreateEventFrame = function()
+        if not IsGuildOfficer() then
+            Print("Só oficiais podem criar eventos.")
+            return
+        end
+        if createEventFrame then
+            createEventFrame:Show()
+            createEventFrame.editName:SetFocus()
+            return
+        end
+
+        local f = CreateFrame("Frame", "GnomeHunterCreateEventFrame", UIParent, "BackdropTemplate")
+        createEventFrame = f
+        f:SetSize(380, 260)
+        f:SetPoint("CENTER")
+        f:SetFrameStrata("DIALOG")
+        f:SetMovable(true)
+        f:EnableMouse(true)
+        f:RegisterForDrag("LeftButton")
+        f:SetScript("OnDragStart", function(s) s:StartMoving() end)
+        f:SetScript("OnDragStop",  function(s) s:StopMovingOrSizing() end)
+        if f.SetBackdrop then
+            f:SetBackdrop({
+                bgFile   = "Interface\\Buttons\\WHITE8X8",
+                edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+                tile = false, tileSize = 16, edgeSize = 14,
+                insets = { left = 4, right = 4, top = 4, bottom = 4 }
+            })
+            f:SetBackdropColor(0.06, 0.04, 0.04, 0.96)
+            f:SetBackdropBorderColor(0.4, 0.1, 0.1, 1)
+        end
+
+        -- Header
+        local header = f:CreateTexture(nil, "ARTWORK")
+        header:SetColorTexture(0.35, 0.06, 0.06, 1)
+        header:SetPoint("TOPLEFT", 6, -6)
+        header:SetPoint("TOPRIGHT", -6, -6)
+        header:SetHeight(28)
+
+        local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+        title:SetPoint("LEFT", header, "LEFT", 10, 0)
+        title:SetText("|cFFFFD100Criar Evento|r")
+
+        local close = CreateFrame("Button", nil, f)
+        close:SetSize(20, 20)
+        close:SetPoint("TOPRIGHT", -8, -10)
+        local closeText = close:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+        closeText:SetPoint("CENTER")
+        closeText:SetText("|cFFFFAAAAX|r")
+        close:SetScript("OnEnter", function() closeText:SetText("|cFFFF2020X|r") end)
+        close:SetScript("OnLeave", function() closeText:SetText("|cFFFFAAAAX|r") end)
+        close:SetScript("OnClick", function() f:Hide() end)
+
+        -- Aviso de fuso horário
+        local tzNote = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+        tzNote:SetPoint("TOP", header, "BOTTOM", 0, -6)
+        tzNote:SetText("|cFFFFD100Horario de Brasilia (BRT, UTC-3)|r")
+
+        -- Helper pra criar label + EditBox lado a lado
+        local function makeField(labelText, yOffset, width, maxLetters, hint)
+            local lbl = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+            lbl:SetPoint("TOPLEFT", 16, yOffset)
+            lbl:SetWidth(90)
+            lbl:SetJustifyH("RIGHT")
+            lbl:SetText(labelText)
+
+            local eb = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
+            eb:SetSize(width, 20)
+            eb:SetPoint("LEFT", lbl, "RIGHT", 10, 0)
+            eb:SetAutoFocus(false)
+            if maxLetters then eb:SetMaxLetters(maxLetters) end
+            eb:SetScript("OnEscapePressed", function(s) s:ClearFocus(); f:Hide() end)
+
+            if hint then
+                local h = f:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+                h:SetPoint("LEFT", eb, "RIGHT", 6, 0)
+                h:SetText(hint)
+            end
+            return eb
+        end
+
+        f.editName = makeField("Nome:", -54, 200, EVENT_NAME_MAX_LEN)
+        f.editDate = makeField("Data:", -82, 100, 10, "|cFF888888YYYY-MM-DD|r")
+        f.editTime = makeField("Hora:", -110, 60, 5, "|cFF888888HH:MM|r")
+        f.editDur  = makeField("Duracao:", -138, 50, 5, "|cFF888888em horas|r")
+
+        -- Tab ordering
+        f.editName:SetScript("OnTabPressed", function() f.editDate:SetFocus() end)
+        f.editDate:SetScript("OnTabPressed", function() f.editTime:SetFocus() end)
+        f.editTime:SetScript("OnTabPressed", function() f.editDur:SetFocus() end)
+        f.editDur:SetScript("OnTabPressed",  function() f.editName:SetFocus() end)
+
+        -- Enter em qualquer campo tenta criar
+        local function tryCreate()
+            local name = f.editName:GetText()
+            local dstr = f.editDate:GetText()
+            local tstr = f.editTime:GetText()
+            local dur  = tonumber(f.editDur:GetText())
+            if not name or name == "" then
+                Print("|cFFFF8080Preencha o nome do evento.|r")
+                f.editName:SetFocus(); return
+            end
+            if not dstr or dstr == "" or not tstr or tstr == "" then
+                Print("|cFFFF8080Preencha data e hora (BRT).|r")
+                return
+            end
+            local startAt = ParseBRTDateTime(dstr .. " " .. tstr)
+            if not startAt then
+                Print("|cFFFF8080Data/hora invalida. Use YYYY-MM-DD HH:MM.|r")
+                return
+            end
+            if not dur or dur <= 0 then
+                Print("|cFFFF8080Duracao deve ser um numero positivo de horas.|r")
+                f.editDur:SetFocus(); return
+            end
+            local id, err = CreateEvent(name, startAt, dur, playerName)
+            if not id then
+                Print("|cFFFF8080" .. (err or "Erro ao criar evento") .. "|r")
+                return
+            end
+            BroadcastEvent(id)
+            f:Hide()
+            RefreshRankFrame()
+        end
+        f.editName:SetScript("OnEnterPressed", tryCreate)
+        f.editDate:SetScript("OnEnterPressed", tryCreate)
+        f.editTime:SetScript("OnEnterPressed", tryCreate)
+        f.editDur:SetScript("OnEnterPressed",  tryCreate)
+
+        -- Botões
+        local btnOk = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+        btnOk:SetSize(100, 24)
+        btnOk:SetPoint("BOTTOMRIGHT", -16, 16)
+        btnOk:SetText("Criar evento")
+        btnOk:SetScript("OnClick", tryCreate)
+
+        local btnCancel = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+        btnCancel:SetSize(80, 24)
+        btnCancel:SetPoint("RIGHT", btnOk, "LEFT", -6, 0)
+        btnCancel:SetText(CANCEL)
+        btnCancel:SetScript("OnClick", function() f:Hide() end)
+
+        -- Preenche defaults sensatos: hoje + 1h, duração 2h
+        f:SetScript("OnShow", function()
+            local now = ServerNow() + 3600  -- +1 hora como placeholder
+            local brt = date("!*t", now + BRT_OFFSET)
+            f.editName:SetText("")
+            f.editDate:SetText(("%04d-%02d-%02d"):format(brt.year, brt.month, brt.day))
+            f.editTime:SetText(("%02d:%02d"):format(brt.hour, brt.min))
+            f.editDur:SetText("2")
+            f.editName:SetFocus()
+        end)
+
+        f:Hide()  -- começa escondido; chamador chama :Show()
+        f:Show()
+    end
+
+    -- Popup leve pra confirmar cancelamento do evento
+    StaticPopupDialogs["GNOMEHUNTER_CANCELEVENT"] = {
+        text = "Cancelar o evento ativo?",
+        button1 = "Cancelar evento", button2 = CANCEL,
+        OnAccept = function()
+            if not IsGuildOfficer() then return end
+            local id = GnomeHunterDB.activeEventId
+            if id and CancelEvent(id) then
+                BroadcastEventClear(id)
+                RefreshRankFrame()
+            end
         end,
         timeout = 0, whileDead = 1, hideOnEscape = 1, preferredIndex = 3,
     }

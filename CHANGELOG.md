@@ -7,6 +7,24 @@ The GitHub Actions release workflow reads the section matching the release tag
 (e.g. tag `v2.5.0` → section `## [2.5.0]`) and uploads it to CurseForge as the
 changelog for that file. Keep the header format exactly as `## [X.Y.Z] - YYYY-MM-DD`.
 
+## [2.8.0] - 2026-11-28
+
+### Added
+- Full in-game UI for guild events: new `Evento` tab on the ranking window with its own filter, state badge next to the tabs, and a dynamic footer showing the time until the event starts or ends
+- `+ Novo` button next to the tabs opens a dedicated modal (not a one-field popup) with four fields — Nome, Data `YYYY-MM-DD`, Hora `HH:MM`, Duração `em horas` — with tab navigation, Enter submits, sensible defaults (data/hora prefill to one hour from now, duration 2h) and an explicit "Horário de Brasília (BRT, UTC-3)" notice
+- `Cancelar` button next to `+ Novo` opens a confirmation popup and cancels the active event, propagating the clear to the guild
+- Tab tooltip shows event name, BRT window, and status (ativo / cancelado / encerrado / aguardando início)
+- Minimap button tooltip now reports the active or last event with its countdown
+
+### Changed
+- Officer buttons for events (`+ Novo`, `Cancelar`) follow the same hide-for-non-officers policy introduced in v2.7.0 for bounty/reset buttons
+- `Semanal` / `Geral` / `Evento` tabs resized (62 / 48 / 56 px) to fit the third tab without clipping the KILLS header
+- `BuildRankingList`, `ScoreStore` and `MyRankAndScore` accept `view="event"` natively — resolves the store of the active event or the last finished one
+
+### Internal
+- Added `GetDisplayEvent()` helper used by the UI and the minimap tooltip
+- Hide-zero policy of the weekly tab now also applies to the event tab (only you and players who scored in the event appear)
+
 ## [2.7.0] - 2026-11-28
 
 ### Added
