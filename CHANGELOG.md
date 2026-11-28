@@ -7,6 +7,25 @@ The GitHub Actions release workflow reads the section matching the release tag
 (e.g. tag `v2.5.0` → section `## [2.5.0]`) and uploads it to CurseForge as the
 changelog for that file. Keep the header format exactly as `## [X.Y.Z] - YYYY-MM-DD`.
 
+## [2.7.0] - 2026-11-28
+
+### Added
+- Full-ranking sync: on login and on `/gnomo sync` / Sync button, the client asks up to 2 guild members (officers first, then whoever knows the most players) for their complete ranking, so scores of players who are currently offline are received too
+- Addon-message protocol: `SYNCOK:n` (candidate reply to `REQ`), `SYNCREQ:` (pick a peer), `SYNC:view:weekId:resetAt:name,pts,kc,ep;...` (chunked dump, ≤250 bytes per message, 0.3 s apart, 30 s cooldown per requester)
+- Per-player reset epoch (`GnomeHunterDB.epoch`): `/gnomo resetme` stamps a new epoch so the MAX merge on other clients doesn't bring the old score back
+- A client that missed an officer `RESETALL` while offline adopts it when an officer sends a dump with a newer `resetAt`
+
+### Changed
+- `SCORE` and `WSCORE` now merge with MAX instead of overwriting — a stale or wiped client no longer pulls everyone's copy of its score down
+- `/gnomo resetall` (local wipe) is now recoverable: the next sync restores every score via MAX
+- Officer check for your own actions (`IsGuildOfficer`) now uses your guild rank (0 or 1) — the same rule every other client uses to accept officer messages. Before, it used `CanGuildInvite()`, so a non-officer with invite rights could set bounties or reset the ranking only on their own client, while an officer without invite rights couldn't use the buttons
+- Officer buttons (`Player`, `Guild`, `Clear`, `Reset`) are hidden for non-officers instead of disabled; `Help` moves into the `Reset` slot. `Clear` was previously never disabled
+- `/gnomo test` only previews the points a kill would give; it no longer records, syncs or announces a kill (anyone could farm points with it)
+
+### Compatibility
+- v2.6.x clients still answer `REQ` and receive `SCORE`/`WSCORE` as before; they're just never picked as full-sync peers
+- A `/gnomo resetme` done on a v2.6.x client is not seen by v2.7 clients (they keep the higher value)
+
 ## [2.6.0] - 2026-11-27
 
 ### Added

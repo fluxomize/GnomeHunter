@@ -20,7 +20,7 @@ Current version: **v2.5.0**
 - **Weekly player bounty** — officers post a bounty on a specific enemy (name + optional race). Killing them awards **+10 bonus points**.
 - **Enemy guild tag** — officers can tag an entire enemy guild. Killing any member of that guild awards **+1 bonus point** (stacks with player bounty and gnome kill).
 - **Partial-name matching** — setting a bounty with the first name (`Bollha`) matches full-name targets (`Bollha Tall`). Exact match still works.
-- **Officer-only enforcement** — bounty broadcasts (set, clear, guild reset) are rejected locally if the sender isn't rank 0 or 1 in the guild roster, so non-officers can't tamper even on crafted messages.
+- **Officer-only enforcement** — bounty broadcasts (set, clear, guild reset) are rejected locally if the sender isn't rank 0 or 1 in the guild roster, so non-officers can't tamper even on crafted messages. The same rule (your own guild rank 0 or 1) decides who sees the officer buttons and can run officer commands.
 - **Persisted across logouts** — bounties carry a timestamp and are only overwritten by newer broadcasts. The known v2.3 bug where officers accidentally wiped active bounties on re-login is fixed.
 
 ### Proximity alerts
@@ -37,10 +37,10 @@ Current version: **v2.5.0**
   - Header banner and gnome icon.
   - Your current score + rank card.
   - Bounty card with separate rows for player bounty and guild bounty.
-  - Three bounty action buttons (officer-only): `Player`, `Guild`, `Clear`.
+  - Three bounty action buttons (officers only — hidden for everyone else): `Player`, `Guild`, `Clear`.
   - Checkboxes for guild-only filter, proximity alerts, and chat announcer.
   - 15-row ranking table with your row highlighted.
-  - Bottom row: `Sync`, `Publicar`, `Reset` (officer-only global reset), `Help`.
+  - Bottom row: `Sync`, `Publicar`, `Reset` (officers only — hidden for everyone else), `Help`.
 - Draggable minimap button (left-click: ranking; right-click: toggle alerts; drag: reposition); positioned dynamically just outside the minimap border.
 
 ### Reliability
@@ -82,7 +82,7 @@ Current version: **v2.5.0**
 | `/gnomo me` | Dump what every name-resolution API returns for your character |
 | `/gnomo status` | Debug info (cache sizes, bounty state, officer flag) |
 | `/gnomo testalert` | Fire a test proximity alert |
-| `/gnomo test` | Simulate a kill on the current target |
+| `/gnomo test` | Show how many points a kill on the current target would give (nothing is recorded or sent) |
 | `/gnomo build` | Show client version |
 | `/gnomo help` | List every command |
 
@@ -111,6 +111,9 @@ All synchronization traffic travels on the invisible `SendAddonMessage` channel 
 | `SCORE:name:pts:kcount` | Broadcast or Whisper | A client's current all-time score |
 | `WSCORE:name:weekId:pts:kcount` | Broadcast or Whisper | A client's score for the current week (ignored if `weekId` isn't the current week) |
 | `REQ:name` | Broadcast | Asks everyone to reply with their score (replies go via Whisper) |
+| `SYNCOK:n` | Whisper | Reply to `REQ`: "I know `n` players and can send the full ranking" |
+| `SYNCREQ:` | Whisper | Asks one chosen peer for its full ranking |
+| `SYNC:view:weekId:resetAt:name,pts,kc,ep;...` | Whisper (Broadcast on `resetme`) | Chunk of the full ranking (`view` = `all` or `week`), merged with MAX |
 | `BOUNTY:name:race:setBy:setAt` | Broadcast or Whisper | Active player bounty |
 | `BOUNTYCLR:timestamp` | Broadcast | Clears the player bounty |
 | `BOUNTYREQ:` | Broadcast | Asks officers to send the current bounty (reply via Whisper) |
@@ -118,6 +121,8 @@ All synchronization traffic travels on the invisible `SendAddonMessage` channel 
 | `GBCLR:timestamp` | Broadcast | Clears the guild bounty |
 | `GBREQ:` | Broadcast | Asks officers to send the current guild bounty |
 | `RESETALL:timestamp` | Broadcast | Officer-only full reset of the guild's ranking |
+
+Every client keeps the whole guild's ranking locally. `REQ` only brings the scores of members who are online (each one answers with its own score), so after it the client also asks up to 2 peers — officers first, then whoever knows the most players — for their **full ranking**, which includes players who are offline. All score merges use MAX (kills only go up). Resets are handled by epochs: dumps from before the last officer `RESETALL` (`resetAt`) are dropped, and `/gnomo resetme` stamps a new per-player epoch so older copies of that score are discarded instead of winning the MAX.
 
 The only user-visible messages posted to `/g` are those you actively opt into (kill announcer, death announcer) or explicitly trigger (`Publicar` button / `/gnomo publish`).
 
