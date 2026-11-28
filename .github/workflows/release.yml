@@ -1,0 +1,135 @@
+name: Release to CurseForge
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (ex: v2.5.1)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "release" ]; then
+            tag="${{ github.event.release.tag_name }}"
+          else
+            tag="${{ github.event.inputs.tag }}"
+          fi
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ver.outputs.tag }}
+
+      - name: Validate TOC version matches tag
+        run: |
+          set -euo pipefail
+          toc_version=$(grep -oP '^## Version:\s*\K.+' GnomeHunter.toc | tr -d '\r')
+          expected="${{ steps.ver.outputs.version }}"
+          if [ "$toc_version" != "$expected" ]; then
+            echo "::error::TOC version ($toc_version) does not match tag ($expected). Bump GnomeHunter.toc before releasing."
+            exit 1
+          fi
+
+      - name: Build zip (addon files only)
+        id: build
+        run: |
+          set -euo pipefail
+          # Só arquivos que o WoW client carrega — nada de infra (.github, .gitignore,
+          # README, logo etc. ficam fora).
+          addon_files=(GnomeHunter.toc GnomeHunter.lua logo.svg CHANGELOG.md)
+
+          mkdir -p dist/GnomeHunter
+          for f in "${addon_files[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Addon file missing: $f"
+              exit 1
+            fi
+            cp "$f" dist/GnomeHunter/
+          done
+
+          zip_name="GnomeHunter-${{ steps.ver.outputs.tag }}.zip"
+          (cd dist && zip -r "$zip_name" GnomeHunter)
+
+          echo "---- zip contents ----"
+          unzip -l "dist/$zip_name"
+          echo "----------------------"
+
+          echo "zip_path=dist/$zip_name" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to CurseForge
+        env:
+          CF_TOKEN: ${{ secrets.CURSEFORGE_TOKEN }}
+          CF_PROJECT_ID: ${{ secrets.CURSEFORGE_PROJECT_ID }}
+          CF_GAME_VERSIONS: ${{ secrets.CURSEFORGE_GAME_VERSIONS }}
+          RELEASE_BODY: ${{ github.event.release.body }}
+          DISPLAY_NAME: GnomeHunter ${{ steps.ver.outputs.tag }}
+          ZIP_PATH: ${{ steps.build.outputs.zip_path }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${CF_TOKEN:-}" ] || [ -z "${CF_PROJECT_ID:-}" ] || [ -z "${CF_GAME_VERSIONS:-}" ]; then
+            echo "::error::Missing required config. Need secrets: CURSEFORGE_TOKEN, CURSEFORGE_PROJECT_ID, CURSEFORGE_GAME_VERSIONS."
+            exit 1
+          fi
+
+          # Extrai a seção da versão atual do CHANGELOG.md.
+          # Formato esperado: "## [X.Y.Z] - YYYY-MM-DD" até o próximo "## [...]".
+          version="${{ steps.ver.outputs.version }}"
+          changelog_from_file=""
+          if [ -f CHANGELOG.md ]; then
+            changelog_from_file=$(awk -v ver="$version" '
+              $0 ~ "^## \\["ver"\\]" { found=1; next }
+              found && /^## \[/ { exit }
+              found
+            ' CHANGELOG.md | sed -e '/./,$!d' | sed -e ':a' -e '/^\n*$/{$d;N;ba' -e '}')
+          fi
+
+          if [ -n "$changelog_from_file" ]; then
+            changelog="$changelog_from_file"
+            echo "Using changelog from CHANGELOG.md (version $version)"
+          else
+            changelog="${RELEASE_BODY:-No changelog provided.}"
+            echo "No CHANGELOG.md section for $version — falling back to release body."
+          fi
+
+          metadata=$(jq -n \
+            --arg changelog "$changelog" \
+            --arg displayName "$DISPLAY_NAME" \
+            --argjson gameVersions "$CF_GAME_VERSIONS" \
+            '{changelog: $changelog, changelogType: "markdown", displayName: $displayName, gameVersions: $gameVersions, releaseType: "release"}')
+
+          echo "Uploading $ZIP_PATH to CurseForge project $CF_PROJECT_ID"
+          echo "Metadata: $metadata"
+
+          http_code=$(curl -sS -o response.json -w "%{http_code}" \
+            -H "X-Api-Token: $CF_TOKEN" \
+            --form-string "metadata=$metadata" \
+            -F "file=@$ZIP_PATH" \
+            "https://wow.curseforge.com/api/projects/$CF_PROJECT_ID/upload-file")
+
+          echo "HTTP $http_code"
+          cat response.json
+          echo
+
+          if [ "$http_code" != "200" ]; then
+            echo "::error::CurseForge upload failed (HTTP $http_code)"
+            exit 1
+          fi
+
+          file_id=$(jq -r '.id // empty' response.json)
+          if [ -n "$file_id" ]; then
+            echo "::notice::CurseForge file ID: $file_id"
+          fi
