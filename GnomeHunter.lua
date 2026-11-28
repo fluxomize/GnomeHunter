@@ -1,4 +1,4 @@
--- GnomeHunter v2.6.0 - eventos configuráveis com data/hora início + duração (BRT)
+-- GnomeHunter v2.7.0 - sync do ranking inteiro (inclui quem está offline) com merge por MAX
 -- Estratégia de kill baseada no Spy (WoW Forever / Interface 16001)
 
 local BOOT = CreateFrame("Frame")
@@ -11,7 +11,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     -- Constantes
     -- =================================================================
     local ADDON_PREFIX   = "GNMHUNT"
-    local VERSION        = "2.6.0"
+    local VERSION        = "2.7.0"
     local BOUNTY_BONUS   = 10    -- pontos extras pelo bounty de player
     local GUILD_BONUS    = 1     -- pontos extras por matar qualquer um da guild bounty
     local ALERT_COOLDOWN = 60    -- segundos entre alertas do mesmo nome
@@ -22,6 +22,13 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     local EVENT_MAX_DURATION_H = 168   -- máximo de 7 dias (168h) por evento
     local EVENT_HISTORY_MAX    = 5     -- quantos eventos encerrados manter em histórico
     local KILLLOG_MAX          = 5000  -- rolling buffer local de kills
+
+    -- Sync do ranking inteiro
+    local SYNC_PEERS      = 2     -- de quantos membros pedir o ranking completo
+    local SYNC_PICK_DELAY = 5     -- segundos coletando SYNCOK antes de escolher os peers
+    local SYNC_SEND_GAP   = 0.3   -- intervalo entre mensagens do dump (evita throttle)
+    local SYNC_MSG_MAX    = 250   -- addon message tem limite de 255 bytes
+    local SYNC_COOLDOWN   = 30    -- segundos mínimos entre dumps pro mesmo player
 
     -- Brasília = UTC-3, sem horário de verão desde 2019
     local BRT_OFFSET = -3 * 3600
@@ -74,6 +81,9 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
 
     GnomeHunterDB.minimap = GnomeHunterDB.minimap or { angle = 0.45, hide = false }
     GnomeHunterDB.resetAt = GnomeHunterDB.resetAt or 0
+    -- Época do score de cada player: [nome] = serverTime do último /gnomo resetme.
+    -- Usado no sync por MAX pra não ressuscitar score que o dono zerou.
+    GnomeHunterDB.epoch = GnomeHunterDB.epoch or {}
 
     -- Eventos
     -- GnomeHunterDB.events[eventId] = {
@@ -166,7 +176,8 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
     local tabWeek, tabAll, footerHint
     local rankLines = {}
     local guildCheck, alertCheck, announceCheck
-    local btnSetBounty, btnSetGuildBounty, btnReset
+    local btnSetBounty, btnSetGuildBounty, btnClearBounty, btnReset
+    local btnPublish, btnHelp
 
     -- Forward declaration (ScheduleRosterRefresh e outras helpers chamam antes da definição)
     local RefreshRankFrame
@@ -516,15 +527,6 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         end
     end
 
-    local function IsGuildOfficer()
-        if not IsInGuild() then return false end
-        if CanGuildInvite then
-            local ok, can = pcall(CanGuildInvite)
-            if ok and can then return true end
-        end
-        return false
-    end
-
     -- Checa se um nome arbitrário é oficial, consultando o roster
     -- (defensivo: aceita rankIndex 0 ou 1 - GM + primeiro oficial)
     local function IsRosterOfficer(name)
@@ -532,6 +534,18 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         if not key then return false end
         local rank = guildRanks[key]
         return rank ~= nil and rank <= 1
+    end
+
+    -- Eu sou oficial? Mesmo critério que os outros clientes usam pra validar
+    -- minhas mensagens (IsRosterOfficer), senão eu faria ações que ninguém aceita.
+    local function IsGuildOfficer()
+        if not IsInGuild() then return false end
+        if GetGuildInfo then
+            local _, _, rankIndex = GetGuildInfo("player")
+            rankIndex = Readable(rankIndex)
+            if type(rankIndex) == "number" then return rankIndex <= 1 end
+        end
+        return IsRosterOfficer(playerName)
     end
 
     -- Dado um nome (possivelmente só "Bollha"), procura no roster pelo
@@ -570,6 +584,154 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
                 s.kcount[shortName] = nil
             end
         end
+    end
+
+    -- =================================================================
+    -- Sync do ranking inteiro
+    -- =================================================================
+    -- O REQ só traz o score de quem está online (cada um manda o próprio).
+    -- Pra receber também o score de quem está offline, pedimos o ranking
+    -- COMPLETO a até SYNC_PEERS membros:
+    --   REQ (broadcast) -> SYNCOK:<n> (whisper, clientes v2.7+)
+    --   -> SYNCREQ: (whisper pros escolhidos) -> SYNC:... (whisper, N mensagens)
+    -- Merge sempre por MAX: kills só crescem, então o maior valor é o mais novo.
+    -- Resets quebram essa regra, então são tratados por época:
+    --   * resetAt (RESETALL de oficial): dump de outra época é descartado
+    --   * epoch[nome] (resetme): época mais nova substitui, mais antiga é
+    --     descartada, mesma época -> MAX
+
+    -- Nome curto -> completo via roster, consolidando a entry curta por MAX
+    local function ResolveScoreName(who)
+        local full = FindFullNameInRoster(who)
+        if not full or full == who then return who end
+        for _, view in ipairs(SCORE_STORES) do
+            local s = ScoreStore(view)
+            if s.kills[who] or s.kcount[who] then
+                s.kills[full]  = math.max(s.kills[full]  or 0, s.kills[who]  or 0)
+                s.kcount[full] = math.max(s.kcount[full] or 0, s.kcount[who] or 0)
+                s.kills[who], s.kcount[who] = nil, nil
+            end
+        end
+        local ep = GnomeHunterDB.epoch
+        if ep[who] then
+            ep[full] = math.max(ep[full] or 0, ep[who])
+            ep[who] = nil
+        end
+        return full
+    end
+
+    local function MergeScore(store, who, pts, kc)
+        store.kills[who]  = math.max(store.kills[who]  or 0, pts)
+        store.kcount[who] = math.max(store.kcount[who] or 0, kc)
+    end
+
+    local function MergeSyncEntry(view, who, pts, kc, ep)
+        local known = GnomeHunterDB.epoch[who] or 0
+        if ep < known then return end  -- valor de antes do resetme do dono
+        if ep > known then
+            -- Dono zerou depois do que eu sei: os valores antigos não valem mais
+            GnomeHunterDB.epoch[who] = ep
+            for _, v in ipairs(SCORE_STORES) do
+                local s = ScoreStore(v)
+                s.kills[who], s.kcount[who] = 0, 0
+            end
+        end
+        MergeScore(ScoreStore(view), who, pts, kc)
+    end
+
+    -- Dump do ranking: SYNC:view:weekId:resetAt:nome,pts,kc,ep;nome,pts,kc,ep;...
+    local function BuildSyncMessages()
+        EnsureWeek()
+        local msgs = {}
+        for _, view in ipairs(SCORE_STORES) do
+            local s = ScoreStore(view)
+            local header = ("SYNC:%s:%d:%d:"):format(
+                view, GnomeHunterDB.weekly.weekId, GnomeHunterDB.resetAt or 0)
+            local buf, len = {}, #header
+            for name, pts in pairs(s.kills) do
+                local kc = s.kcount[name] or 0
+                local ep = GnomeHunterDB.epoch[name] or 0
+                if (pts > 0 or kc > 0 or ep > 0) and not string.find(name, "[,;:]") then
+                    local entry = ("%s,%d,%d,%d"):format(name, pts, kc, ep)
+                    if len + #entry + 1 > SYNC_MSG_MAX and #buf > 0 then
+                        msgs[#msgs + 1] = header .. table.concat(buf, ";")
+                        buf, len = {}, #header
+                    end
+                    buf[#buf + 1] = entry
+                    len = len + #entry + 1
+                end
+            end
+            if #buf > 0 then msgs[#msgs + 1] = header .. table.concat(buf, ";") end
+        end
+        return msgs
+    end
+
+    local lastDumpTo = {}  -- [sender] = GetTime() do último dump enviado
+    local function SendFullRanking(target)
+        local now = GetTime()
+        if lastDumpTo[target] and now - lastDumpTo[target] < SYNC_COOLDOWN then return end
+        lastDumpTo[target] = now
+        for i, msg in ipairs(BuildSyncMessages()) do
+            if C_Timer and C_Timer.After then
+                C_Timer.After((i - 1) * SYNC_SEND_GAP, function() Whisper(msg, target) end)
+            else
+                Whisper(msg, target)
+            end
+        end
+    end
+
+    local function KnownPlayersCount()
+        local n = 0
+        for _, pts in pairs(GnomeHunterDB.kills) do
+            if pts > 0 then n = n + 1 end
+        end
+        return n
+    end
+
+    -- nil = não estou coletando; tabela = [sender] = { n, officer }
+    local syncCandidates
+
+    -- Pede score de todos online (REQ) e, em seguida, o ranking completo
+    -- aos melhores candidatos: oficiais primeiro (propagam o resetAt), depois
+    -- quem conhece mais players.
+    local function StartFullSync()
+        if not IsInGuild() then return end
+        Broadcast("REQ:" .. (playerName or ""))
+        -- Já coletando (sync repetido / retry do login): o timer pendente escolhe
+        if syncCandidates or not (C_Timer and C_Timer.After) then return end
+        syncCandidates = {}
+        C_Timer.After(SYNC_PICK_DELAY, function()
+            local list = {}
+            for sender, c in pairs(syncCandidates or {}) do
+                list[#list + 1] = { sender = sender, n = c.n, officer = c.officer }
+            end
+            syncCandidates = nil
+            table.sort(list, function(a, b)
+                if a.officer ~= b.officer then return a.officer end
+                return a.n > b.n
+            end)
+            for i = 1, math.min(SYNC_PEERS, #list) do
+                Whisper("SYNCREQ:", list[i].sender)
+            end
+        end)
+    end
+
+    -- Zera o próprio score (semanal e geral) com época nova, pra que o MAX
+    -- dos outros clientes não traga o valor antigo de volta
+    local function ResetMyScore()
+        if not playerName then return end
+        for _, view in ipairs(SCORE_STORES) do
+            ScoreStore(view).kills[playerName]  = 0
+            ScoreStore(view).kcount[playerName] = 0
+        end
+        local ep = ServerNow()
+        GnomeHunterDB.epoch[playerName] = ep
+        EnsureWeek()
+        Broadcast(("SYNC:all:%d:%d:%s,0,0,%d"):format(
+            GnomeHunterDB.weekly.weekId, GnomeHunterDB.resetAt or 0, playerName, ep))
+        BroadcastMyScore()  -- clientes antigos zeram via SCORE (sobrescrita)
+        Print("Sua contagem foi zerada.")
+        RefreshRankFrame()
     end
 
     -- =================================================================
@@ -922,17 +1084,14 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             end
         end
 
-        -- habilitar botões de bounty/reset só para oficiais
+        -- botões de bounty/reset só aparecem para oficiais
         local officer = IsGuildOfficer()
-        if btnSetBounty then
-            if officer then btnSetBounty:Enable() else btnSetBounty:Disable() end
+        for _, btn in ipairs({ btnSetBounty, btnSetGuildBounty, btnClearBounty, btnReset }) do
+            btn:SetShown(officer)
         end
-        if btnSetGuildBounty then
-            if officer then btnSetGuildBounty:Enable() else btnSetGuildBounty:Disable() end
-        end
-        if btnReset then
-            if officer then btnReset:Enable() else btnReset:Disable() end
-        end
+        -- Help ocupa o lugar do Reset quando ele está escondido
+        btnHelp:ClearAllPoints()
+        btnHelp:SetPoint("LEFT", officer and btnReset or btnPublish, "RIGHT", 4, 0)
 
         -- lista
         local list = BuildRankingList(view)
@@ -1095,7 +1254,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         bountyGuildText:SetJustifyH("LEFT")
         bountyGuildText:SetText("|cFF666666(sem bounty)|r")
 
-        -- botões de set bounty (só habilitados para oficiais)
+        -- botões de bounty (só aparecem para oficiais)
         btnSetBounty = MakeButton(rankFrame, "Player", 70, 20)
         btnSetBounty:SetPoint("TOPLEFT", bountyCard, "BOTTOMLEFT", 6, 2)
         btnSetBounty:SetScript("OnClick", function()
@@ -1110,7 +1269,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             StaticPopup_Show("GNOMEHUNTER_SETGUILDBOUNTY")
         end)
 
-        local btnClearBounty = MakeButton(rankFrame, "Clear", 70, 20)
+        btnClearBounty = MakeButton(rankFrame, "Clear", 70, 20)
         btnClearBounty:SetPoint("LEFT", btnSetGuildBounty, "RIGHT", 4, 0)
         btnClearBounty:SetScript("OnClick", function()
             if not IsGuildOfficer() then return end
@@ -1207,7 +1366,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         btnSync:SetPoint("BOTTOMLEFT", 10, 12)
         btnSync:SetScript("OnClick", function()
             if IsInGuild() then
-                Broadcast("REQ:" .. (playerName or ""))
+                StartFullSync()
                 Broadcast("BOUNTYREQ:")
                 Broadcast("GBREQ:")
                 ScheduleRosterRefresh()
@@ -1217,7 +1376,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             end
         end)
 
-        local btnPublish = MakeButton(rankFrame, "Publicar", 78, 22)
+        btnPublish = MakeButton(rankFrame, "Publicar", 78, 22)
         btnPublish:SetPoint("LEFT", btnSync, "RIGHT", 4, 0)
         btnPublish:SetScript("OnClick", function()
             StaticPopup_Show("GNOMEHUNTER_PUBLISH", string.lower(ViewLabel(GnomeHunterDB.opts.rankView)))
@@ -1248,7 +1407,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         end)
         btnReset:SetScript("OnLeave", function() GameTooltip:Hide() end)
 
-        local btnHelp = MakeButton(rankFrame, "Help", 78, 22)
+        btnHelp = MakeButton(rankFrame, "Help", 78, 22)
         btnHelp:SetPoint("LEFT", btnReset, "RIGHT", 4, 0)
         btnHelp:SetScript("OnClick", function()
             Print("Digite |cFFFFD100/gnomo help|r no chat para ver todos os comandos.")
@@ -1628,15 +1787,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
         text = "Zerar seu próprio score (semanal e geral)?",
         button1 = "Sim", button2 = CANCEL,
         OnAccept = function()
-            if playerName then
-                for _, view in ipairs(SCORE_STORES) do
-                    ScoreStore(view).kills[playerName]  = 0
-                    ScoreStore(view).kcount[playerName] = 0
-                end
-                BroadcastMyScore()
-                Print("Sua contagem foi zerada.")
-                RefreshRankFrame()
-            end
+            ResetMyScore()
         end,
         timeout = 0, whileDead = 1, hideOnEscape = 1, preferredIndex = 3,
     }
@@ -1685,7 +1836,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             ToggleGUI()
         elseif cmd == "sync" then
             if IsInGuild() then
-                Broadcast("REQ:" .. (playerName or ""))
+                StartFullSync()
                 Broadcast("BOUNTYREQ:")
                 Broadcast("GBREQ:")
                 ScheduleRosterRefresh()
@@ -1860,15 +2011,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             end
             PublishRankingToGuild(n, view)
         elseif cmd == "resetme" then
-            if playerName then
-                for _, view in ipairs(SCORE_STORES) do
-                    ScoreStore(view).kills[playerName]  = 0
-                    ScoreStore(view).kcount[playerName] = 0
-                end
-                BroadcastMyScore()
-                Print("Sua contagem foi zerada.")
-                RefreshRankFrame()
-            end
+            ResetMyScore()
         elseif cmd == "resetall" then
             GnomeHunterDB.kills  = {}
             GnomeHunterDB.kcount = {}
@@ -1892,8 +2035,22 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             else
                 n, r, lvl = "TESTE", "Gnome", 60
             end
-            RegisterKill(n, r, g, lvl)
-            RefreshRankFrame()
+            -- Só simula: não grava, não sincroniza e não anuncia, senão
+            -- qualquer um farmaria pontos repetindo o comando
+            local pb = GnomeHunterDB.bounty
+            local gb = GnomeHunterDB.guildBounty
+            local pts = 0
+            if r == "Gnome" then pts = pts + 1 end
+            if pb and pb.name and NameMatchesBounty(n, pb.name) then pts = pts + BOUNTY_BONUS end
+            if gb and gb.name and g and string.lower(g) == string.lower(gb.name) then
+                pts = pts + GUILD_BONUS
+            end
+            if pts > 0 then
+                Print(("|cFFAAAAAA[teste]|r %s (%s) valeria |cFF00FF00+%d pt|r - não registrado")
+                    :format(n or "?", r or "?", pts))
+            else
+                Print(("|cFFAAAAAA[teste]|r %s (%s) não vale ponto"):format(n or "?", r or "?"))
+            end
         elseif cmd == "status" then
             local tally = 0
             for _ in pairs(guidRace) do tally = tally + 1 end
@@ -1969,7 +2126,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             Print("  /gnomo publish [N] [geral] - envia top N (padrão 10, semanal) no chat da guild")
             Print("  /gnomo resetme          - zera sua contagem")
             Print("  /gnomo resetall         - zera base local")
-            Print("  /gnomo test             - simula kill no target atual")
+            Print("  /gnomo test             - simula kill no target (não conta ponto)")
             Print("  /gnomo status           - debug")
             Print("  /gnomo build            - versão do cliente")
         else
@@ -2064,7 +2221,7 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
                 C_Timer.After(3, function()
                     if IsInGuild() then
                         BroadcastMyScore()                 -- todos sabem meu score
-                        Broadcast("REQ:" .. playerName)    -- peço os deles (resposta via WHISPER)
+                        StartFullSync()                    -- peço os deles + ranking completo
                         Broadcast("BOUNTYREQ:")
                         Broadcast("GBREQ:")
                         Broadcast("EVENTREQ:")
@@ -2167,15 +2324,10 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
                 if who and pts then
                     -- Se o sender mandou só o primeiro nome (addon antigo), promove
                     -- para nome completo usando o guild roster
-                    local full = FindFullNameInRoster(who)
-                    if full and full ~= who then
-                        -- Limpa a entry curta pra não ficar duplicada
-                        GnomeHunterDB.kills[who]  = nil
-                        GnomeHunterDB.kcount[who] = nil
-                        who = full
-                    end
-                    GnomeHunterDB.kills[who]  = tonumber(pts)
-                    GnomeHunterDB.kcount[who] = tonumber(kc)
+                    who = ResolveScoreName(who)
+                    -- MAX: um score menor vindo do dono é resto de DB perdido/antigo.
+                    -- Reset legítimo (resetme) chega antes via SYNC com época nova.
+                    MergeScore(GnomeHunterDB, who, tonumber(pts), tonumber(kc))
                     RefreshRankFrame()
                 end
 
@@ -2188,14 +2340,8 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
                     -- Só aceita score da semana ATUAL (score de semana passada
                     -- de quem ficou offline na virada é descartado)
                     if tonumber(wk) == w.weekId then
-                        local full = FindFullNameInRoster(who)
-                        if full and full ~= who then
-                            w.kills[who]  = nil
-                            w.kcount[who] = nil
-                            who = full
-                        end
-                        w.kills[who]  = tonumber(pts)
-                        w.kcount[who] = tonumber(kc)
+                        who = ResolveScoreName(who)
+                        MergeScore(w, who, tonumber(pts), tonumber(kc))
                         RefreshRankFrame()
                     end
                 end
@@ -2203,6 +2349,50 @@ BOOT:SetScript("OnEvent", function(self, event, loadedName)
             elseif cmd == "REQ" then
                 -- Whisper direto pra quem pediu, não polui a guild com N respostas
                 SendMyScore(sender)
+                -- Me candidato a mandar o ranking completo (só clientes v2.7+ entendem)
+                Whisper("SYNCOK:" .. KnownPlayersCount(), sender)
+
+            elseif cmd == "SYNCOK" then
+                -- Só vale durante a janela de coleta do StartFullSync
+                if not syncCandidates then return end
+                local n = tonumber(string.match(message, "^SYNCOK:(%d+)$"))
+                if not n or n == 0 then return end
+                syncCandidates[sender] = { n = n, officer = IsRosterOfficer(senderName) }
+
+            elseif cmd == "SYNCREQ" then
+                SendFullRanking(sender)
+
+            elseif cmd == "SYNC" then
+                -- SYNC:view:weekId:resetAt:nome,pts,kc,ep;...
+                local _, _, view, wk, rat, body =
+                    string.find(message, "^SYNC:(%a+):(%-?%d+):(%d+):(.*)$")
+                if view ~= "all" and view ~= "week" then return end
+                rat = tonumber(rat)
+                local myResetAt = GnomeHunterDB.resetAt or 0
+                if rat < myResetAt then return end  -- ranking de antes do último RESETALL
+                if rat > myResetAt then
+                    -- Perdi um RESETALL (estava offline). Só aceito de oficial,
+                    -- igual ao próprio RESETALL.
+                    if not IsRosterOfficer(senderName) then return end
+                    -- RESETALL grava time() (relógio local do oficial): tolera 1 dia de desvio
+                    if rat > ServerNow() + 86400 then return end
+                    GnomeHunterDB.kills  = {}
+                    GnomeHunterDB.kcount = {}
+                    wipe(GnomeHunterDB.weekly.kills)
+                    wipe(GnomeHunterDB.weekly.kcount)
+                    if playerName then EnsureEntry(playerName) end
+                    GnomeHunterDB.resetAt = rat
+                    Print(("|cFFFFD100Ranking foi zerado por um oficial enquanto você estava offline (via %s).|r")
+                        :format(senderName or "?"))
+                end
+                if view == "week" then
+                    EnsureWeek()
+                    if tonumber(wk) ~= GnomeHunterDB.weekly.weekId then return end
+                end
+                for who, pts, kc, ep in string.gmatch(body, "([^,;]+),(%d+),(%d+),(%d+)") do
+                    MergeSyncEntry(view, ResolveScoreName(who), tonumber(pts), tonumber(kc), tonumber(ep))
+                end
+                RefreshRankFrame()
 
             -- PLAYER BOUNTY - só aceita de oficial
             elseif cmd == "BOUNTY" then
